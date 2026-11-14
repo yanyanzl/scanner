@@ -1,0 +1,6 @@
+feedparser
+apscheduler
+streamlit
+pyyaml
+requests
+python-dotenv

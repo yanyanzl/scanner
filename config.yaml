@@ -1,0 +1,42 @@
+# Global Trend Radar 配置
+# 扫描间隔（分钟），Windows / macOS 本地运行，默认 15 分钟
+# 免费优先：默认只启用 RSS + GDELT；其他来源需配置凭证后手动开启，
+# 付费来源（X）只有在没有免费可选方案时才考虑开启。
+scan_interval_minutes: 15
+db_path: "data/trends.sqlite3"
+
+# 权重是初始假设，需用真实数据校准
+weights:
+  growth: 0.30
+  scale: 0.20
+  acceleration: 0.20
+  cross_platform: 0.20
+  novelty: 0.10
+
+sources:
+  rss:
+    enabled: true
+    feeds:
+      - "https://feeds.bbci.co.uk/news/world/rss.xml"
+      - "https://feeds.bbci.co.uk/news/technology/rss.xml"
+  gdelt:
+    enabled: true
+    query: "technology OR breaking news"
+    max_records: 50
+  reddit:
+    enabled: false  # 配置 REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET 后改为 true
+    subreddits:
+      - "worldnews"
+      - "technology"
+  youtube:
+    enabled: false  # 配置 YOUTUBE_API_KEY 后改为 true
+    queries:
+      - "breaking news"
+      - "technology"
+  x:
+    enabled: false  # 配置 X_BEARER_TOKEN 后改为 true（按付费服务处理）
+    queries:
+      - "breaking news"
+  tiktok:
+    enabled: false  # 需要官方授权数据接口，当前为预留 stub，不采集
+    queries: []
