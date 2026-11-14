@@ -24,12 +24,12 @@ sources:
     query: "technology OR breaking news"
     max_records: 50
   reddit:
-    enabled: false  # 配置 REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET 后改为 true
+    enabled: true  # 已开启：无凭证时 adapter 返回 [] 并记“未启用”，填好 REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET 后自动采集
     subreddits:
       - "worldnews"
       - "technology"
   youtube:
-    enabled: false  # 配置 YOUTUBE_API_KEY 后改为 true
+    enabled: true  # 已开启：无凭证时 adapter 返回 [] 并记“未启用”，填好 YOUTUBE_API_KEY 后自动采集
     queries:
       - "breaking news"
       - "technology"
@@ -40,3 +40,10 @@ sources:
   tiktok:
     enabled: false  # 需要官方授权数据接口，当前为预留 stub，不采集
     queries: []
+
+# P1 事件聚类 v0.1（本地 TF-IDF + 余弦相似度 + 并查集，无新依赖）
+# similarity_threshold 是初始假设，需用真实多平台数据校准，见 docs/P1_CLUSTERING.md
+clustering:
+  similarity_threshold: 0.35
+  min_platforms: 1
+  time_window_hours: 24
