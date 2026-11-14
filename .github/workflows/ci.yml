@@ -1,0 +1,26 @@
+# CI 只验证代码，不运行真实采集、不保存历史数据。
+# Actions runner 是临时的，SQLite 历史只存在于 Windows 本地电脑上。
+# 真实 API 密钥绝不写在这里；如需在 CI 中使用，请用 GitHub Secrets，
+# 例如：REDDIT_CLIENT_ID、REDDIT_CLIENT_SECRET、YOUTUBE_API_KEY、X_BEARER_TOKEN。
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      - name: 编译检查
+        run: python -m compileall trend_radar
+      - name: 评分单元测试
+        run: python -m unittest discover -s tests -v
+      - name: 单次扫描冒烟测试（仅 RSS + GDELT，无凭证平台会显示未启用）
+        run: python run_scheduler.py --once
