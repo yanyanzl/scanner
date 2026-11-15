@@ -1,8 +1,12 @@
 """DeepL 翻译测试：requests.post 全部 mock，绝不调真实 DeepL 接口。
 
-同时验证：额度用完（456）停掉本轮、403 回退到 gtx、key 后缀选 host、
-key 绝不进日志；以及 collect_once 的 DeepL 轮次接线（每小时最多 1 次、
-只翻分数最高的标题、去重提醒端到端）。
+gtx 端点已删除（2026-11-15 深挖结论：修不好），DeepL 现在是 Azure
+的备用：没配 Azure key 时 DeepL 是主力，Azure 429/403 或请求失败时
+才走 DeepL；同样每小时最多 1 次、只翻优先内容（Top 5 事件名 +
+爆发事件名 + 各事件最高分成员标题，见 docs/TRANSLATION.md）。
+同时验证：额度用完（456）停掉本轮、403 时标题保持英文、key 后缀
+选 host、key 绝不进日志；以及 collect_once 的 DeepL 轮次接线
+（每小时最多 1 次、去重提醒端到端）。
 """
 import logging
 import os
@@ -93,7 +97,7 @@ class TestDeeplTranslate(unittest.TestCase):
                 deepl_translate("Hello world", FREE_KEY)
 
     def test_403_returns_empty_string(self):
-        # 403（如 key 发错 host）不抛异常，调用方把标题留给 gtx。
+        # 403（如 key 发错 host）不抛异常，调用方把标题留到下一轮再试。
         with mock.patch.object(translate_mod.requests, "post") as post:
             post.return_value = _FakeResp(status_code=403, json_data={"message": "forbidden"})
             self.assertEqual(deepl_translate("Hello world", FREE_KEY), "")
@@ -215,7 +219,7 @@ def _item(platform, title, url, engagement=0):
     }
 
 
-def _config(db_path, deepl_max_per_round=1):
+def _config(db_path, deepl_max_per_round=15):
     return {
         "scan_interval_minutes": 15,
         "db_path": str(db_path),
@@ -231,8 +235,7 @@ def _config(db_path, deepl_max_per_round=1):
         "translation": {
             "enabled": True,
             "target_lang": "zh-CN",
-            "max_per_round": 30,
-            "delay_seconds": 0,
+            "azure_max_per_round": 15,
             "deepl_max_per_round": deepl_max_per_round,
         },
     }
@@ -250,23 +253,25 @@ def _deepl_post_mock(translation="已翻译"):
 
 
 class TestDeeplWiring(unittest.TestCase):
-    def test_deepl_round_translates_top_scored_title(self):
+    def test_deepl_round_translates_top_events_no_azure_key(self):
+        """没配 Azure key 时 DeepL 是主力：Top 5 事件名 + 成员标题都翻。"""
         with tempfile.TemporaryDirectory() as d:
             db_path = Path(d) / "trends.sqlite3"
-            # 高互动量标题分数更高，应优先走 DeepL；低分标题留给 gtx。
+            # 高互动量标题分数更高；两个不同标题是两个事件，都在 Top 5 里。
             high = _item("rss", "Top story with huge engagement", "https://example.com/a", engagement=10000)
             low = _item("rss", "Quiet story nobody reads", "https://example.com/b", engagement=0)
             env = {"DEEPL_API_KEY": FREE_KEY}
+            env = {k: v for k, v in os.environ.items() if k != "AZURE_TRANSLATOR_KEY"}
+            env["DEEPL_API_KEY"] = FREE_KEY
             with (
-                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.dict(os.environ, env, clear=True),
                 mock.patch("trend_radar.collector.rss.fetch", mock.Mock(return_value=[high, low])),
-                mock.patch.object(
-                    translate_mod, "translate_text", mock.Mock(side_effect=lambda t, **k: t)
-                ),  # gtx 全部失败回退
                 mock.patch.object(translate_mod.requests, "post", _deepl_post_mock()),
             ):
                 counts = collect_once(config=_config(db_path))
-            self.assertEqual(counts["deepl_translated"], 2)  # 1 个标题 + 1 个事件名
+            # 两个事件名（同时也是各自最高分成员标题，去重后 2 条文本）。
+            self.assertEqual(counts["deepl_translated"], 2)
+            self.assertEqual(counts["azure_translated"], 0)
             self.assertEqual(counts["saved"], 2)
             conn = dbmod.connect(db_path)
             row_a = conn.execute(
@@ -277,7 +282,7 @@ class TestDeeplWiring(unittest.TestCase):
             ).fetchone()
             conn.close()
             self.assertEqual(row_a["title_zh"], "已翻译")
-            self.assertIsNone(row_b["title_zh"])
+            self.assertEqual(row_b["title_zh"], "已翻译")
             # DeepL 轮次已记时间。
             self.assertTrue((Path(d) / ".deepl_last_run").exists())
 
@@ -286,13 +291,11 @@ class TestDeeplWiring(unittest.TestCase):
             db_path = Path(d) / "trends.sqlite3"
             first = _item("rss", "First round story", "https://example.com/a")
             second = _item("rss", "Fresh story an hour later", "https://example.com/c")
-            env = {"DEEPL_API_KEY": FREE_KEY}
+            env = {k: v for k, v in os.environ.items() if k != "AZURE_TRANSLATOR_KEY"}
+            env["DEEPL_API_KEY"] = FREE_KEY
             with (
-                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.dict(os.environ, env, clear=True),
                 mock.patch("trend_radar.collector.rss.fetch", mock.Mock(return_value=[first])),
-                mock.patch.object(
-                    translate_mod, "translate_text", mock.Mock(side_effect=lambda t, **k: t)
-                ),
                 mock.patch.object(
                     translate_mod.requests, "post", _deepl_post_mock()
                 ) as post,
@@ -314,23 +317,26 @@ class TestDeeplWiring(unittest.TestCase):
             conn.close()
             self.assertIsNone(row["title_zh"])
 
-    def test_no_key_no_deepl_call(self):
+    def test_no_key_no_translation_call(self):
         with tempfile.TemporaryDirectory() as d:
             db_path = Path(d) / "trends.sqlite3"
             item = _item("rss", "Apple unveils new iPhone chip", "https://example.com/a")
-            env = {k: v for k, v in os.environ.items() if k != "DEEPL_API_KEY"}
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("DEEPL_API_KEY", "AZURE_TRANSLATOR_KEY")
+            }
             with (
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch("trend_radar.collector.rss.fetch", mock.Mock(return_value=[item])),
-                mock.patch.object(
-                    translate_mod, "translate_text", mock.Mock(side_effect=lambda t, **k: t)
-                ),
                 mock.patch.object(translate_mod.requests, "post") as post,
             ):
                 counts = collect_once(config=_config(db_path))
             post.assert_not_called()
             self.assertEqual(counts["deepl_translated"], 0)
+            self.assertEqual(counts["azure_translated"], 0)
             self.assertFalse((Path(d) / ".deepl_last_run").exists())
+            self.assertFalse((Path(d) / ".azure_last_run").exists())
 
     def test_456_keeps_round_alive_and_titles_english(self):
         with tempfile.TemporaryDirectory() as d:
@@ -341,14 +347,12 @@ class TestDeeplWiring(unittest.TestCase):
             logger.addHandler(capture)
             logger.setLevel(logging.WARNING)
             try:
-                env = {"DEEPL_API_KEY": FREE_KEY}
+                env = {k: v for k, v in os.environ.items() if k != "AZURE_TRANSLATOR_KEY"}
+                env["DEEPL_API_KEY"] = FREE_KEY
                 with (
-                    mock.patch.dict(os.environ, env, clear=False),
+                    mock.patch.dict(os.environ, env, clear=True),
                     mock.patch(
                         "trend_radar.collector.rss.fetch", mock.Mock(return_value=[item])
-                    ),
-                    mock.patch.object(
-                        translate_mod, "translate_text", mock.Mock(side_effect=lambda t, **k: t)
                     ),
                     mock.patch.object(translate_mod.requests, "post") as post,
                 ):
@@ -369,32 +373,28 @@ class TestDeeplWiring(unittest.TestCase):
             self.assertEqual(len([m for m in capture.messages if "456" in m]), 1)
             self.assertTrue((Path(d) / ".deepl_last_run").exists())
 
-    def test_403_falls_back_to_gtx_for_that_title(self):
-        """DeepL 403（如 key 发错 host）时该标题留给 gtx 翻，不丢失。"""
+    def test_deepl_403_title_stays_english_no_fallback(self):
+        """DeepL 403 时该标题保持英文——gtx 已删除，没有兜底可回退。"""
         with tempfile.TemporaryDirectory() as d:
             db_path = Path(d) / "trends.sqlite3"
             item = _item("rss", "Apple unveils new iPhone chip", "https://example.com/a")
-            env = {"DEEPL_API_KEY": FREE_KEY}
+            env = {k: v for k, v in os.environ.items() if k != "AZURE_TRANSLATOR_KEY"}
+            env["DEEPL_API_KEY"] = FREE_KEY
             with (
-                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.dict(os.environ, env, clear=True),
                 mock.patch("trend_radar.collector.rss.fetch", mock.Mock(return_value=[item])),
-                mock.patch.object(
-                    translate_mod,
-                    "translate_text",
-                    mock.Mock(return_value="苹果发布新款 iPhone 芯片"),
-                ),
                 mock.patch.object(translate_mod.requests, "post") as post,
             ):
                 post.return_value = _FakeResp(status_code=403, json_data={})
                 counts = collect_once(config=_config(db_path))
-            # DeepL 403 没翻出来，但同一轮 gtx 把它翻出来了。
             self.assertEqual(counts["saved"], 1)
+            self.assertEqual(counts["deepl_translated"], 0)
             conn = dbmod.connect(db_path)
             row = conn.execute(
                 "SELECT title_zh FROM items WHERE url = ?", ("https://example.com/a",)
             ).fetchone()
             conn.close()
-            self.assertEqual(row["title_zh"], "苹果发布新款 iPhone 芯片")
+            self.assertIsNone(row["title_zh"])
 
 
 class TestDedupEndToEnd(unittest.TestCase):

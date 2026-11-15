@@ -1,17 +1,20 @@
 """标题自动翻译：把非中文标题翻成中文，供 Dashboard 与 Telegram 提醒显示。
 
-用 Google 免费翻译接口的非官方 client=gtx 端点（无需 key）：
-GET https://translate.googleapis.com/translate_a/single
-    ?client=gtx&sl=auto&tl=zh-CN&dt=t&q=<text>
-返回 JSON 如 [[["你好世界","Hello world",null,null,3]],null,"en"]，
-data[0] 是 [译文, 原文, ...] 的分段列表，拼接各段译文即得全文。
+主力：Microsoft Azure AI Translator（官方 API，免费 F0 层每月 200 万
+字符，见 docs/TRANSLATION.md）。备用：DeepL API（一次性 100 万字符）。
+两个都是官方、有文档的服务；key 只出现在请求头里，日志里绝不出现。
 
-注意：这是非官方端点，没有任何可用性保证——可能被限流或屏蔽。
-所以本模块的设计原则和 Reddit / YouTube 没有凭证时一样：失败时
-安静地回退到原标题，只记一条 warning，绝不抛异常、不中断采集。
-翻译结果缓存在 SQLite（items.title_zh / events.name_zh），同一标题
-只翻一次，每轮还有数量上限（见 collector.py），不会每轮都去调接口。
-如果 Google 哪天彻底屏蔽这个端点，备选方案见 docs/TRANSLATION.md。
+翻译范围很窄（用户定）：只翻 Top 5 事件的名字、触发 Telegram 提醒
+的事件名字、以及这些事件各自分数最高的成员标题。其他内容保持英文，
+不做大批量翻译。翻译跑在每轮的最后一步——聚类、排名、爆发检测之后，
+发提醒之前，这样提醒里当轮就能用上中文事件名（见 collector.py）。
+
+已删除：Google 免费 gtx 端点（2026-11-15 深挖结论：它是网页版 Google
+翻译的非官方内部端点，429 是 IP 声誉 + 程序化客户端识别造成，降速、
+换参数、加账号/key 都修不好，已彻底放弃；调用代码与测试一并删除）。
+
+缓存：翻译结果存在 SQLite（items.title_zh / events.name_zh），同一标题
+只翻一次。失败的翻译绝不写入——失败标题下轮再试，不会永久失去机会。
 """
 from __future__ import annotations
 
@@ -21,16 +24,6 @@ import re
 import requests
 
 logger = logging.getLogger(__name__)
-
-GTX_URL = "https://translate.googleapis.com/translate_a/single"
-
-# 该端点是 translate.google.com 网页版用的接口，期望浏览器客户端；
-# 用浏览器 User-Agent 而不是默认的 python-requests 可以少被限流。
-# 这不是绕过认证（接口本身无 key、无登录），只是按它期望的客户端发请求。
-BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
 
 # 中文算“已经是中文”的阈值：CJK 字占 CJK+拉丁字母的比例 >= 0.9 时不翻译。
 # 数字、标点、emoji、空格不计入分母——纯数字标题（如 "15.11.2026"）
@@ -56,88 +49,143 @@ def needs_translation(text: str) -> bool:
     return cjk / len(letters) < CJK_ALREADY_CHINESE_RATIO
 
 
-def _parse_gtx_response(data) -> str:
-    """从 gtx 返回的 JSON 里拼接译文；解析不出译文时返回 ""。"""
-    try:
-        segments = data[0]
-    except (TypeError, IndexError, KeyError):
-        return ""
-    parts: list[str] = []
-    for seg in segments or []:
-        try:
-            translated = seg[0]
-        except (TypeError, IndexError):
-            continue
-        if translated:
-            parts.append(str(translated))
-    return "".join(parts).strip()
+# ---- Azure AI Translator（主力）----
+# 免费 F0 层：每月 2,000,000 字符（按月重置），超额需手动切 S1（$10/百万字符）。
+# 端点：POST https://api.cognitive.microsofttranslator.com/translate
+#     ?api-version=3.0&to=zh-Hans
+# 注意：不传 from 参数，让 Azure 自动检测源语言——要翻的标题里有英文、
+# 马拉雅拉姆语、印地语、俄语等多种语言，强制 from=en 会翻错小语种标题。
+# 请求体是 JSON 数组 [{"Text": "..."}, ...]，一次请求可带多条（单请求上限
+# 50,000 字符，本项目每轮远不到这个数）。认证是请求头
+# Ocp-Apim-Subscription-Key，区域资源还要加 Ocp-Apim-Subscription-Region。
+# F0 超额时返回 429/403（第三方说法：只报错、不自动扣费，未找到官方逐字
+# 确认，见 docs/TRANSLATION.md）。
+AZURE_TRANSLATE_URL = "https://api.cognitive.microsofttranslator.com/translate"
+
+# 每轮 Azure 字符硬上限：1200 字/轮 × 24 轮/天 × 30 天 = 864,000 字/月，
+# 只有 F0 每月 200 万额度的约 43%（见 docs/TRANSLATION.md 的算术）。
+# 实际用量远低于上限（每轮约 10-15 条 × 约 60 字 ≈ 600-900 字）。
+AZURE_MAX_CHARS_PER_ROUND = 1200
 
 
-def translate_text(text: str, target_lang: str = "zh-CN", timeout: int = 15) -> str:
-    """把 text 翻译成目标语言（默认简体中文）。
+class AzureUnavailable(Exception):
+    """Azure 本轮不可用（429/403/401/网络错/返回异常）：调用方改走 DeepL。"""
 
-    任何失败（网络错误、非 200、JSON 解析失败、返回里没有译文）
-    都返回原文本，不抛异常。标题是公开新闻标题，记 warning 时可以带上。
+
+def _parse_azure_response(data, texts: list[str]) -> dict[str, str]:
+    """从 Azure 返回的 JSON 里取译文，按输入顺序一一对应。
+
+    成功时形如 [{"translations": [{"text": "...", "to": "zh-Hans"}]}]，
+    与请求体的 texts 一一对应。某条解析不出或译文为空时跳过该条
+    （调用方不存、下一轮再试）；译文与原文相同也跳过（等于没翻出来）。
     """
-    if not text or not text.strip():
-        return text
+    results: dict[str, str] = {}
+    if not isinstance(data, list):
+        return results
+    for text, entry in zip(texts, data):
+        try:
+            translated = str(entry["translations"][0]["text"]).strip()
+        except (TypeError, KeyError, IndexError, AttributeError):
+            continue
+        if translated and translated != text:
+            results[text] = translated
+    return results
+
+
+def azure_translate_many(
+    texts: list[str],
+    api_key: str,
+    region: str | None = None,
+    max_texts: int = 15,
+    max_chars: int = AZURE_MAX_CHARS_PER_ROUND,
+    target_lang: str = "zh-Hans",
+    timeout: int = 15,
+) -> tuple[dict[str, str], int, bool]:
+    """批量用 Azure 翻译：最多 max_texts 条、源文总字符不超过 max_chars。
+
+    全部文本一次请求发完（远低于单请求 50,000 字符上限）。返回
+    (results, chars_used, budget_exhausted)：results 只含成功翻出的
+    {原文: 译文}，chars_used 是本批已提交的源文字符数（失败的请求记 0），
+    budget_exhausted 为 True 表示本轮条数/字符预算已满、剩余文本没发。
+    不传 from 参数：让 Azure 自动检测源语言（标题里有多种语言）。
+    任何失败（429/403/401/网络错/返回异常）都只记一条 warning 后抛
+    AzureUnavailable——调用方改走 DeepL。429/403 不断言是月额度还是
+    频率限制（响应里没说就不猜）。key 只出现在请求头里，日志和异常
+    信息里绝不出现——原异常的文本可能夹带请求细节，所以这里只用固定
+    文案，不拼原异常。
+    """
+    clean: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        if not text or not text.strip() or text in seen:
+            continue
+        seen.add(text)
+        clean.append(text)
+    batch: list[str] = []
+    chars_used = 0
+    for text in clean:
+        if len(batch) >= max_texts or chars_used + len(text) > max_chars:
+            break  # 再加这条就超本轮预算：停掉，留到下一轮
+        batch.append(text)
+        chars_used += len(text)
+    exhausted = len(batch) < len(clean)
+    if not batch or not api_key:
+        return {}, 0, exhausted
+    headers = {"Ocp-Apim-Subscription-Key": api_key}
+    if (region or "").strip():
+        headers["Ocp-Apim-Subscription-Region"] = region.strip()
     try:
-        resp = requests.get(
-            GTX_URL,
-            params={
-                "client": "gtx",
-                "sl": "auto",
-                "tl": target_lang,
-                "dt": "t",
-                "q": text,
-            },
-            headers={"User-Agent": BROWSER_USER_AGENT},
+        resp = requests.post(
+            AZURE_TRANSLATE_URL,
+            params={"api-version": "3.0", "to": target_lang},
+            headers=headers,
+            json=[{"Text": text} for text in batch],
             timeout=timeout,
         )
+        if resp.status_code in (429, 403):
+            logger.warning(
+                "Azure 翻译受限（HTTP %s）：本轮停止 Azure，改走 DeepL"
+                "（可能是月额度或频率限制，见 docs/TRANSLATION.md）",
+                resp.status_code,
+            )
+            raise AzureUnavailable(f"Azure 翻译受限（HTTP {resp.status_code}）")
+        if resp.status_code == 401:
+            logger.warning(
+                "Azure 翻译认证失败（HTTP 401）：请检查 AZURE_TRANSLATOR_KEY "
+                "是否正确，本轮改走 DeepL"
+            )
+            raise AzureUnavailable("Azure 翻译认证失败（HTTP 401）")
         if resp.status_code != 200:
-            raise ValueError(f"翻译接口返回 HTTP {resp.status_code}")
-        translated = _parse_gtx_response(resp.json())
-        if not translated:
-            raise ValueError("翻译接口返回里没有译文")
-        return translated
-    except Exception as exc:
-        logger.warning("翻译失败（用原标题）: %s | %s", exc, text[:80])
-        return text
+            logger.warning(
+                "Azure 翻译失败（HTTP %s）：本轮改走 DeepL", resp.status_code
+            )
+            raise AzureUnavailable(f"Azure 翻译失败（HTTP {resp.status_code}）")
+        results = _parse_azure_response(resp.json(), batch)
+        if not results:
+            logger.warning("Azure 翻译失败（返回里没有可用译文）：本轮改走 DeepL")
+            raise AzureUnavailable("Azure 翻译返回里没有可用译文")
+        return results, chars_used, exhausted
+    except AzureUnavailable:
+        raise
+    except Exception:
+        # 固定文案：原异常的文本可能夹带请求细节（甚至 key），绝不记、绝不拼。
+        logger.warning("Azure 翻译请求失败：本轮改走 DeepL")
+        raise AzureUnavailable("Azure 翻译请求失败") from None
 
 
-def translate_titles(
-    titles: list[str], target_lang: str = "zh-CN", timeout: int = 15
-) -> dict[str, str]:
-    """批量翻译标题，返回 {原文: 译文}。
-
-    不需要翻译的标题直接映射到自身，不调接口；相同标题只翻一次。
-    单个标题失败不影响其他标题（translate_text 本身不抛异常）。
-    """
-    result: dict[str, str] = {}
-    for title in titles:
-        if title in result:
-            continue
-        if not needs_translation(title):
-            result[title] = title
-        else:
-            result[title] = translate_text(title, target_lang=target_lang, timeout=timeout)
-    return result
-
-
-# ---- DeepL（官方 API，重要标题专用）----
-# gtx 端点 2026-11-15 已确认对用户不可用：云服务器 IP 与用户家里宽带 IP
-# 上全部返回 HTTP 429。DeepL 是官方、有文档的替代：免费额度内不花钱，
-# 但字符要省着用——所以 DeepL 只在每小时最多 1 次的轮次里翻“最重要的”
-# 标题（分数最高的内容标题 + 事件名），其余仍走 gtx（它一旦恢复就能
-# 覆盖大批量；恢复不了时大批量标题就保持英文，不影响采集和排名）。
-# 额度与注册步骤见 docs/TRANSLATION.md。
+# ---- DeepL（备用）----
+# Azure 不可用（没配 key、429/403、请求失败）时才走 DeepL。DeepL 按字符
+# 计费，免费额度有限——新注册只能选 Developer 计划：一次性 100 万字符，
+# 用完不恢复（旧版每月 50 万字符的 API Free 已停售）。所以 DeepL 同样
+# 只翻优先内容，每小时最多 1 次轮次（见 collector.py），字符硬上限与
+# Azure 相同。额度与注册步骤见 docs/TRANSLATION.md。
 DEEPL_FREE_HOST = "api-free.deepl.com"
 DEEPL_PRO_HOST = "api.deepl.com"
 DEEPL_TRANSLATE_PATH = "/v2/translate"
 
-# 每轮 DeepL 字符硬上限：660 字/轮 × 24 轮/天 × 31 天 = 491,040 字，
-# 无论标题多长，一个月都超不过免费额度（见 docs/TRANSLATION.md 的算术）。
-DEEPL_MAX_CHARS_PER_ROUND = 660
+# 每轮 DeepL 字符硬上限：1200 字/轮 × 24 轮/天 × 30 天 = 864,000 字/月。
+# DeepL 只在 Azure 不可用时跑，实际用量远低于这个上限。
+DEEPL_MAX_CHARS_PER_ROUND = 1200
 
 
 class DeepLQuotaExhausted(Exception):
@@ -153,7 +201,7 @@ def deepl_host(api_key: str) -> str:
 
 
 def deepl_target_lang(target_lang: str) -> str:
-    """把 gtx 的语言代码（zh-CN）换成 DeepL 的代码（ZH）。"""
+    """把配置的语言代码（zh-CN）换成 DeepL 的代码（ZH）。"""
     lang = (target_lang or "zh-CN").strip().lower()
     if lang.startswith("zh"):
         return "ZH"
@@ -176,7 +224,7 @@ def deepl_translate(text: str, api_key: str, target_lang: str = "ZH", timeout: i
 
     只有额度用完（HTTP 456）时抛 DeepLQuotaExhausted，让调用方停掉本轮
     的 DeepL 调用。其他失败（401/403/429/网络错/返回无译文）只记 warning，
-    返回 ""——调用方会把该标题留给 gtx 或下一轮再试。
+    返回 ""——调用方把该标题留给下一轮再试。
     key 只出现在 Authorization 请求头里，日志和异常信息里绝不出现。
     """
     if not text or not text.strip() or not api_key:
@@ -216,7 +264,7 @@ def deepl_translate_many(
     """批量用 DeepL 翻译：最多 max_texts 条、源文总字符不超过 max_chars。
 
     返回 (results, chars_used, quota_exhausted)：results 只含成功翻出的
-    {原文: 译文}，失败的原文不在里面（调用方不存、留给 gtx 或下一轮）；
+    {原文: 译文}，失败的原文不在里面（调用方不存、下一轮再试）；
     chars_used 是本批已提交的源文字符数（按 DeepL 的计费口径，提交即算，
     失败的也算，宁可多算不少算）；quota_exhausted 为 True 表示中途撞上
     HTTP 456，剩余文本不再调接口。

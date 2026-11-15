@@ -119,24 +119,23 @@ sources:
 telegram:
   enabled: true
 
-# 标题自动翻译（免费）：非中文标题翻成中文再显示/提醒。
-# 用 Google 免费翻译接口的非官方 client=gtx 端点，无需 key；可能被限流
-# 或屏蔽，失败时自动回退到原标题，不影响采集。翻译结果缓存在数据库
-# （items.title_zh / events.name_zh），同一标题只翻一次；每轮最多调
-# max_per_round 次接口，中文标题不调接口、不占预算。见 docs/TRANSLATION.md。
+# 标题自动翻译：只翻优先内容（Top 5 事件名 + 爆发事件名 + 各事件最高分
+# 成员标题），其他内容保持英文。Azure 主用、DeepL 备用，每小时最多 1 次
+# 翻译轮次；key 放本地 .env（AZURE_TRANSLATOR_KEY / DEEPL_API_KEY）。
+# 翻译结果缓存在数据库（items.title_zh / events.name_zh），同一标题只翻
+# 一次；失败不存，下一轮再试。见 docs/TRANSLATION.md。
 translation:
   enabled: true
   target_lang: zh-CN
-  max_per_round: 30
-  # 两次翻译接口调用之间等 0.5 秒：免费接口对连续请求很敏感，
-  # 30 条连发容易直接 429；慢一点反而更容易翻出来。失败不存 title_zh，
-  # 下一轮会再试（见 collector.py）；中文标题不调接口、不占预算。
-  # DeepL 免费 API（见 docs/TRANSLATION.md）：每小时最多 1 次 DeepL 轮次，
-  # 每轮最多翻 deepl_max_per_round 个分数最高的标题 + 10 个事件名；
-  # 免费额度：旧版 API Free 每月 50 万字符，新注册的 Developer 计划为
-  # 一次性 100 万字符（用完不恢复）；另有每轮 660 字符硬上限兜底。
-  # key 放本地 .env（DEEPL_API_KEY），没 key 时不走 DeepL，只用 gtx 端点。
-  deepl_max_per_round: 1
+  # 只翻优先内容（见 docs/TRANSLATION.md）：Top 5 事件名 + 爆发事件名 +
+  # 各事件分数最高的成员标题，其他内容保持英文。Azure 主用、DeepL 备用，
+  # 每小时最多 1 次翻译轮次（state 文件 data/.azure_last_run /
+  # data/.deepl_last_run）。azure_max_per_round / deepl_max_per_round 是
+  # 每轮各提供方最多翻的文本条数；每轮字符硬上限 1200 在 translate.py 里。
+  # key 放本地 .env：AZURE_TRANSLATOR_KEY（+ 区域资源才填
+  # AZURE_TRANSLATOR_REGION）、DEEPL_API_KEY；都没配时不翻译。
+  azure_max_per_round: 15
+  deepl_max_per_round: 15
 
 # P1 事件聚类 v0.1（本地 TF-IDF + 余弦相似度 + 并查集，无新依赖）
 # similarity_threshold 是初始假设，需用真实多平台数据校准，见 docs/P1_CLUSTERING.md

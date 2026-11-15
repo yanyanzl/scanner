@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -109,12 +108,13 @@ _NEWS_APIS = (
 )
 
 
-# 事件名每轮最多调几次翻译接口（事件少，10 次足够）。
-EVENT_TRANSLATE_PER_ROUND = 10
+# 翻译轮次间隔（分钟）：Azure 与 DeepL 都按字符计费，每小时最多 1 次
+# 翻译轮次（state 文件 data/.azure_last_run / data/.deepl_last_run），
+# 见 docs/TRANSLATION.md。
+TRANSLATION_INTERVAL_MINUTES = 60
 
-# DeepL 轮次间隔（分钟）：DeepL 按字符收费，每小时最多 1 次 DeepL 轮次
-# （state 文件 data/.deepl_last_run），见 docs/TRANSLATION.md。
-DEEPL_INTERVAL_MINUTES = 60
+# 翻译范围：只翻排名前 N 的事件（见 docs/TRANSLATION.md）。
+TOP_TRANSLATE_EVENTS = 5
 
 
 def _translation_config(cfg: dict) -> dict:
@@ -123,219 +123,250 @@ def _translation_config(cfg: dict) -> dict:
     注意：配置里完全没有 translation 一节时默认关闭——这样旧的
     内联配置（测试里大量使用）不会突然开始调翻译接口；正式的
     config.yaml 里有该节，enabled 默认为 true。
+    azure_max_per_round / deepl_max_per_round 是每轮各提供方最多翻
+    的文本条数（Top 5 事件名 + 爆发事件名 + 各事件分数最高的成员标题，
+    见 _collect_priority_texts）；字符硬上限在 translate.py 里。
     """
     section = cfg.get("translation")
     if not isinstance(section, dict):
         return {
             "enabled": False,
             "target_lang": "zh-CN",
-            "max_per_round": 30,
-            "delay_seconds": 0.5,
-            "deepl_max_per_round": 1,
+            "azure_max_per_round": 15,
+            "deepl_max_per_round": 15,
         }
     return {
         "enabled": bool(section.get("enabled", True)),
         "target_lang": str(section.get("target_lang", "zh-CN")),
-        "max_per_round": int(section.get("max_per_round", 30)),
-        "delay_seconds": float(section.get("delay_seconds", 0.5)),
-        "deepl_max_per_round": int(section.get("deepl_max_per_round", 1)),
+        "azure_max_per_round": int(section.get("azure_max_per_round", 15)),
+        "deepl_max_per_round": int(section.get("deepl_max_per_round", 15)),
     }
 
 
-def _translate_top_items_deepl(conn, tr_cfg: dict, api_key: str, max_chars: int) -> tuple[int, int, bool]:
-    """DeepL 轮次：按分数从高到低取还没有中文标题的内容，用 DeepL 翻。
+def _ranking_top_events(events: list[dict], bursts: list[dict], cfg: dict) -> list[dict]:
+    """取综合排名前 TOP_TRANSLATE_EVENTS 的事件（见 trend_radar/event_ranking.py）。
 
-    只翻分数最高的 deepl_max_per_round 个标题（默认 1 个），且本轮
-    DeepL 源文总字符不超过 max_chars。返回 (翻出的条数, 已用字符数,
-    额度是否用完）。失败的标题不存 title_zh，留给 gtx 或下一轮再试；
-    本函数本身不抛异常（调用方仍有 try 兜底）。
+    排名权重/半衰期读传入的 config（ranking 一节），缺失时用默认值。
+    失败时返回 []（不翻译、不中断采集）。
     """
-    max_texts = max(0, int(tr_cfg.get("deepl_max_per_round", 1)))
-    if max_texts <= 0 or not api_key:
-        return 0, 0, False
-    rows = conn.execute(
-        "SELECT title FROM items "
-        "WHERE title_zh IS NULL OR title_zh = '' "
-        "ORDER BY score DESC, collected_at DESC LIMIT 200"
-    ).fetchall()
-    titles: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        title = (row["title"] or "").strip()
-        if title and title not in seen and translate_mod.needs_translation(title):
-            seen.add(title)
-            titles.append(title)
-        if len(titles) >= max_texts:
-            break
-    if not titles:
-        return 0, 0, False
-    results, chars_used, exhausted = translate_mod.deepl_translate_many(
-        titles,
-        api_key,
-        max_texts=max_texts,
-        max_chars=max_chars,
-        target_lang=translate_mod.deepl_target_lang(str(tr_cfg.get("target_lang", "zh-CN"))),
-    )
-    for title, translated in results.items():
-        if translated and translated != title:
-            conn.execute(
-                "UPDATE items SET title_zh = ? "
-                "WHERE title = ? AND (title_zh IS NULL OR title_zh = '')",
-                (translated, title),
-            )
-    conn.commit()
-    if results:
-        logger.info("DeepL 本轮翻译标题 %d 条（%d 字符）", len(results), chars_used)
-    return len(results), chars_used, exhausted
+    try:
+        from trend_radar.event_ranking import rank_events
 
-
-def _translate_pending_items(conn, tr_cfg: dict) -> int:
-    """翻译还没有中文标题的内容，返回本轮翻译接口调用次数。
-
-    每轮上限 max_per_round 次接口调用；中文标题直接记 title_zh=原标题，
-    不调接口、不占预算；相同标题只翻一次。只翻最近的记录（按
-    collected_at 倒序），超预算的留到下一轮。单个标题失败只记 warning，
-    不影响其他标题；本函数本身不抛异常。
-    """
-    if not tr_cfg.get("enabled", False):
-        return 0
-    max_calls = max(0, int(tr_cfg.get("max_per_round", 30)))
-    target_lang = str(tr_cfg.get("target_lang", "zh-CN"))
-    delay = max(0.0, float(tr_cfg.get("delay_seconds", 0.5)))
-    rows = conn.execute(
-        "SELECT id, title FROM items "
-        "WHERE title_zh IS NULL OR title_zh = '' "
-        "ORDER BY collected_at DESC LIMIT 500"
-    ).fetchall()
-    titles: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        title = (row["title"] or "").strip()
-        if title and title not in seen:
-            seen.add(title)
-            titles.append(title)
-    api_calls = 0
-    for title in titles:
-        api_called = False
-        try:
-            if not translate_mod.needs_translation(title):
-                translated = title
-            elif api_calls >= max_calls:
-                continue  # 预算用完：该标题留到下一轮
-            else:
-                translated = translate_mod.translate_text(title, target_lang=target_lang)
-                api_calls += 1
-                api_called = True
-                if delay:
-                    time.sleep(delay)
-        except Exception as exc:
-            logger.warning("翻译标题失败（用原标题）: %s", exc)
-            continue
-        if api_called and translated == title:
-            # 接口调了但返回了原标题（translate_text 失败回退）：
-            # 不存！否则该标题会被当成“已翻好”而永久失去重试机会。
-            # 下一轮它仍是 title_zh 为空，会再试一次。
-            continue
-        conn.execute(
-            "UPDATE items SET title_zh = ? "
-            "WHERE title = ? AND (title_zh IS NULL OR title_zh = '')",
-            (translated, title),
+        ranking = cfg.get("ranking") or {}
+        weights = ranking.get("weights") if isinstance(ranking.get("weights"), dict) else None
+        half_life = ranking.get("freshness_half_life_hours")
+        ranked = rank_events(
+            events,
+            bursts=bursts,
+            weights=weights,
+            freshness_half_life_hours=(float(half_life) if half_life is not None else None),
         )
-    conn.commit()
-    if api_calls:
-        logger.info("本轮翻译标题 %d 条（接口调用）", api_calls)
-    return api_calls
+        return ranked[:TOP_TRANSLATE_EVENTS]
+    except Exception as exc:
+        logger.warning("事件排名失败（本轮不翻译事件名）: %s", exc)
+        return []
 
 
-def _translate_pending_events(
+def _collect_priority_texts(
+    events_by_id: dict, top_events: list[dict], bursts: list[dict]
+) -> list[dict]:
+    """收集本轮要翻译的文本（按优先级排序，每条带上它的用途）。
+
+    顺序：爆发事件名（提醒当轮就要用中文名）→ Top 5 事件名 →
+    各目标事件分数最高的成员标题。同一文本只出现一次（事件名经常
+    就是它分数最高的成员标题），用途合并记录。
+    每条形如 {"text": ..., "events": {event_id, ...}, "items": {title, ...}}：
+    events 是以该文本为事件名的事件，items 是以该文本为成员标题的条目。
+    """
+    ordered: list[dict] = []
+    index: dict[str, dict] = {}
+
+    def add(text: str, event_id: str | None = None, item_title: str | None = None) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        entry = index.get(text)
+        if entry is None:
+            entry = {"text": text, "events": set(), "items": set()}
+            index[text] = entry
+            ordered.append(entry)
+        if event_id:
+            entry["events"].add(event_id)
+        if item_title:
+            entry["items"].add(item_title)
+
+    for burst in bursts or []:
+        ev = events_by_id.get(burst.get("event_id", ""))
+        if ev:
+            add(ev.get("name", ""), event_id=ev.get("event_id", ""))
+    for ev in top_events or []:
+        add(ev.get("name", ""), event_id=ev.get("event_id", ""))
+    target_ids: list[str] = []
+    for ev in top_events or []:
+        target_ids.append(ev.get("event_id", ""))
+    for burst in bursts or []:
+        target_ids.append(burst.get("event_id", ""))
+    seen_events: set[str] = set()
+    for event_id in target_ids:
+        if not event_id or event_id in seen_events or event_id not in events_by_id:
+            continue
+        seen_events.add(event_id)
+        members = events_by_id[event_id].get("items") or []
+        if not members:
+            continue
+        top_member = max(members, key=lambda it: float(it.get("score") or 0))
+        title = (top_member.get("title") or "").strip()
+        if title:
+            add(title, item_title=title)
+    return ordered
+
+
+def _translate_priority_texts(
     conn,
     events: list[dict],
+    top_events: list[dict],
+    bursts: list[dict],
     tr_cfg: dict,
-    deepl_key: str | None = None,
-    deepl_chars_budget: int = 0,
-    deepl_exhausted: bool = False,
+    azure_key: str,
+    azure_region: str,
+    deepl_key: str,
+    db_path: Path,
 ) -> tuple[int, int]:
-    """翻译本轮事件里还没有中文名的事件，返回本轮翻译接口调用次数。
+    """翻本轮优先文本（Top 5 事件名 + 爆发事件名 + 各事件最高分成员标题）。
 
-    聚类时已从成员标题的 title_zh 算出 name_zh 的事件，persist_events
-    已存进库，这里查库跳过；其余的在这里直接翻事件名。中文事件名
-    直接记 name_zh=原名，不调接口。每轮上限 10 次接口调用。
-
-    DeepL 轮次（deepl_key 非空且额度没用完时）：先用 DeepL 翻最多 10 个
-    事件名（本轮 DeepL 字符预算剩多少由 deepl_chars_budget 决定，标题
-    翻译已先用掉一部分）；剩下的事件名仍走免费 gtx 端点。返回
-    (gtx 接口调用次数, DeepL 翻出的事件名条数）。
+    提供方顺序：Azure 主用（每小时最多 1 次，state 文件 data/.azure_last_run）；
+    Azure 不可用（没配 key、429/403、请求失败）时改走 DeepL 备用（每小时
+    最多 1 次，state 文件 data/.deepl_last_run）；两个都没配或都没到时间时
+    本轮不翻译。每轮只调一次提供方（Azure 一次请求打包全部文本；DeepL
+    逐条调）。已有中文名的事件/标题不再调接口；中文文本直接记原文为译文，
+    不占预算。失败的翻译不写库，下一轮再试。翻出的事件名同时写回 bursts
+    列表里的 name_zh（提醒当轮就能用中文名）与 events.name_zh；翻出的
+    成员标题写 items.title_zh。返回 (azure 翻出的条数, deepl 翻出的条数)。
+    本函数本身不抛异常。
     """
-    if not tr_cfg.get("enabled", False) or not events:
+    if not tr_cfg.get("enabled", False):
         return 0, 0
-    target_lang = str(tr_cfg.get("target_lang", "zh-CN"))
-    delay = max(0.0, float(tr_cfg.get("delay_seconds", 0.5)))
-    deepl_count = 0
-    if deepl_key and not deepl_exhausted and deepl_chars_budget > 0:
-        pending: list[tuple[str, str]] = []
-        seen_names: set[str] = set()
-        for ev in events:
-            name = (ev.get("name") or "").strip()
-            if not name or name in seen_names:
-                continue
+    events_by_id = {ev.get("event_id", ""): ev for ev in events if ev.get("event_id")}
+    entries = _collect_priority_texts(events_by_id, top_events, bursts)
+    if not entries:
+        return 0, 0
+
+    # 目标解析：去掉已有中文名的，中文文本直接记原文为译文（不调接口）。
+    pending_texts: list[str] = []
+    entry_by_text: dict[str, dict] = {}
+    for entry in entries:
+        text = entry["text"]
+        live_events = set()
+        for event_id in entry["events"]:
             row = conn.execute(
-                "SELECT name_zh FROM events WHERE event_id = ?", (ev.get("event_id", ""),)
+                "SELECT name_zh FROM events WHERE event_id = ?", (event_id,)
             ).fetchone()
-            if row and (row["name_zh"] or "").strip():
-                continue
-            if not translate_mod.needs_translation(name):
-                dbmod.set_event_name_zh(conn, ev["event_id"], name)
-                continue
-            seen_names.add(name)
-            pending.append((ev.get("event_id", ""), name))
-            if len(pending) >= EVENT_TRANSLATE_PER_ROUND:
-                break
-        if pending:
-            results, _chars, _exhausted = translate_mod.deepl_translate_many(
-                [name for _, name in pending],
-                deepl_key,
-                max_texts=EVENT_TRANSLATE_PER_ROUND,
-                max_chars=deepl_chars_budget,
-                target_lang=translate_mod.deepl_target_lang(target_lang),
-            )
-            for event_id, name in pending:
-                translated = results.get(name)
-                if translated:
-                    dbmod.set_event_name_zh(conn, event_id, translated)
-            deepl_count = len(results)
-            if results:
-                logger.info("DeepL 本轮翻译事件名 %d 个", len(results))
-    api_calls = 0
-    for ev in events:
-        event_id = ev.get("event_id", "")
-        name = (ev.get("name") or "").strip()
-        if not event_id or not name:
+            if not row or not (row["name_zh"] or "").strip():
+                live_events.add(event_id)
+        live_items = set()
+        for title in entry["items"]:
+            row = conn.execute(
+                "SELECT 1 FROM items WHERE title = ? "
+                "AND title_zh IS NOT NULL AND title_zh != '' LIMIT 1",
+                (title,),
+            ).fetchone()
+            if not row:
+                live_items.add(title)
+        if not live_events and not live_items:
             continue
-        row = conn.execute(
-            "SELECT name_zh FROM events WHERE event_id = ?", (event_id,)
-        ).fetchone()
-        if row and (row["name_zh"] or "").strip():
+        if not translate_mod.needs_translation(text):
+            for event_id in live_events:
+                dbmod.set_event_name_zh(conn, event_id, text)
+            for title in live_items:
+                conn.execute(
+                    "UPDATE items SET title_zh = ? "
+                    "WHERE title = ? AND (title_zh IS NULL OR title_zh = '')",
+                    (text, title),
+                )
+            conn.commit()
             continue
-        api_called = False
+        entry["events"] = live_events
+        entry["items"] = live_items
+        entry_by_text[text] = entry
+        pending_texts.append(text)
+    if not pending_texts:
+        return 0, 0
+
+    def apply_results(results: dict[str, str]) -> int:
+        """把一批译文写回库 + 内存里的 bursts；返回实际写进的条数。"""
+        applied = 0
+        translated_names: dict[str, str] = {}
+        for text, translated in results.items():
+            entry = entry_by_text.get(text)
+            if entry is None or not translated or translated == text:
+                continue
+            applied += 1
+            for event_id in entry["events"]:
+                dbmod.set_event_name_zh(conn, event_id, translated)
+                translated_names[event_id] = translated
+            for title in entry["items"]:
+                conn.execute(
+                    "UPDATE items SET title_zh = ? "
+                    "WHERE title = ? AND (title_zh IS NULL OR title_zh = '')",
+                    (translated, title),
+                )
+        conn.commit()
+        for burst in bursts or []:
+            name_zh = translated_names.get(burst.get("event_id", ""))
+            if name_zh:
+                burst["name_zh"] = name_zh
+        return applied
+
+    azure_state_path = Path(db_path).parent / ".azure_last_run"
+    deepl_state_path = Path(db_path).parent / ".deepl_last_run"
+    azure_due = bool(azure_key) and _youtube_due(azure_state_path, TRANSLATION_INTERVAL_MINUTES)
+    deepl_due = bool(deepl_key) and _youtube_due(deepl_state_path, TRANSLATION_INTERVAL_MINUTES)
+    azure_count = 0
+    deepl_count = 0
+    azure_attempted = False
+    azure_ok = False
+    if azure_due:
+        azure_attempted = True
         try:
-            if not translate_mod.needs_translation(name):
-                translated = name
-            elif api_calls >= EVENT_TRANSLATE_PER_ROUND:
-                continue  # 预算用完：该事件留到下一轮
-            else:
-                translated = translate_mod.translate_text(name, target_lang=target_lang)
-                api_calls += 1
-                api_called = True
-                if delay:
-                    time.sleep(delay)
+            results, chars_used, _exhausted = translate_mod.azure_translate_many(
+                pending_texts,
+                azure_key,
+                region=azure_region,
+                max_texts=max(0, int(tr_cfg.get("azure_max_per_round", 15))),
+                max_chars=translate_mod.AZURE_MAX_CHARS_PER_ROUND,
+            )
+            azure_count = apply_results(results)
+            azure_ok = True
+            if results:
+                logger.info("Azure 本轮翻译优先文本 %d 条（%d 字符）", len(results), chars_used)
+        except translate_mod.AzureUnavailable:
+            pass  # 下面改走 DeepL；warning 已在 azure_translate_many 里记过
         except Exception as exc:
-            logger.warning("翻译事件名失败（用原名）: %s", exc)
-            continue
-        if api_called and translated == name:
-            # 同上：接口失败回退返回原名时不存，下一轮再试。
-            continue
-        dbmod.set_event_name_zh(conn, event_id, translated)
-    return api_calls, deepl_count
+            logger.warning("Azure 翻译异常（本轮改走 DeepL）: %s", exc)
+        # 每次尝试后都记时间（成功或失败都一样），避免 429 后每 15 分钟又去撞一次。
+        _mark_youtube_run(azure_state_path)
+    if not azure_ok:
+        # DeepL 备用：只有 Azure 没配 key 或本轮 Azure 失败时才跑；
+        # Azure 只是没到时间时不跑——翻译每小时最多 1 次，不翻倍。
+        deepl_may_run = (not azure_key) or azure_attempted
+        if deepl_may_run and deepl_due:
+            try:
+                results, chars_used, _exhausted = translate_mod.deepl_translate_many(
+                    pending_texts,
+                    deepl_key,
+                    max_texts=max(0, int(tr_cfg.get("deepl_max_per_round", 15))),
+                    max_chars=translate_mod.DEEPL_MAX_CHARS_PER_ROUND,
+                    target_lang=translate_mod.deepl_target_lang(
+                        str(tr_cfg.get("target_lang", "zh-CN"))
+                    ),
+                )
+                deepl_count = apply_results(results)
+                if results:
+                    logger.info("DeepL 本轮翻译优先文本 %d 条（%d 字符）", len(results), chars_used)
+            except Exception as exc:
+                logger.warning("DeepL 翻译异常（不影响采集）: %s", exc)
+            _mark_youtube_run(deepl_state_path)
+    return azure_count, deepl_count
 
 
 def collect_once(config: dict | None = None, config_path: Path | None = None) -> dict:
@@ -506,37 +537,12 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
             dbmod.record_snapshot(conn, item_id, float(item.get("engagement") or 0), result["score"])
             saved += 1
 
-        # 标题翻译：本轮新入库、且没有中文标题的内容。评分/入库已经完成，
-        # 翻译绝不拖慢或打断它们；失败只记 warning（见 _translate_pending_items）。
-        # DeepL 轮次判定（每小时最多 1 次，见 docs/TRANSLATION.md）：翻译开启
-        # 且配了 DEEPL_API_KEY、距上次 DeepL 轮次满 60 分钟才跑；没 key 时
-        # 不记时间，填好 key 后下一轮立即就是 DeepL 轮次。DeepL 先翻分数
-        # 最高的标题，再由 gtx 覆盖大批量；deepl_chars_used / deepl_exhausted
-        # 留给后面的事件名翻译共用同一轮字符预算。
+        # 翻译配置（本轮后面才翻：聚类、排名、爆发检测之后，发提醒之前，
+        # 见下面的事件处理；只翻 Top 5 事件名 + 爆发事件名 + 各事件最高分
+        # 成员标题，见 docs/TRANSLATION.md）。
         tr_cfg = _translation_config(cfg)
-        deepl_key = os.environ.get("DEEPL_API_KEY", "").strip() if tr_cfg.get("enabled") else ""
-        deepl_state_path = Path(db_path).parent / ".deepl_last_run"
-        deepl_due = bool(deepl_key) and _youtube_due(deepl_state_path, DEEPL_INTERVAL_MINUTES)
-        deepl_chars_used = 0
-        deepl_exhausted = False
-        deepl_count = 0
+        counts["azure_translated"] = 0
         counts["deepl_translated"] = 0
-        try:
-            if deepl_due:
-                try:
-                    deepl_count, deepl_chars_used, deepl_exhausted = _translate_top_items_deepl(
-                        conn, tr_cfg, deepl_key, translate_mod.DEEPL_MAX_CHARS_PER_ROUND
-                    )
-                except Exception as exc:
-                    logger.warning("DeepL 标题翻译失败（不影响采集）: %s", exc)
-                # 有 key 才记时间：每次尝试后都记（成功或额度用完都一样），
-                # 避免 456 后每 15 分钟又去撞一次。
-                _mark_youtube_run(deepl_state_path)
-                counts["deepl_translated"] = deepl_count
-            counts["translated"] = _translate_pending_items(conn, tr_cfg)
-        except Exception as exc:
-            logger.warning("标题翻译失败（不影响采集）: %s", exc)
-            counts["translated"] = 0
 
         # P2 准备：每轮采集后聚类并持久化事件快照（失败不影响本轮采集）。
         # 只有接在这里，events / event_snapshots 才会随扫描自动积累，
@@ -547,21 +553,44 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
 
             events = cluster_from_db(db_path)
             persist_events(conn, events)
-            # 事件名翻译：必须在 detect_bursts 之前，burst 里才能带上 name_zh；
-            # 失败不影响爆发检测与提醒。
+            bursts = detect_bursts(conn, thresholds=cfg.get("burst"))
+            # 优先翻译：必须在排名与爆发检测之后、发提醒之前——
+            # 只翻 Top 5 事件名 + 爆发事件名 + 各事件最高分成员标题
+            # （见 docs/TRANSLATION.md）。Azure 主用、DeepL 备用，
+            # 每小时最多 1 次；翻出的事件名当轮就写进 bursts 的 name_zh，
+            # 提醒里直接用中文名。失败不影响爆发检测与提醒。
             try:
-                _gtx_calls, deepl_event_count = _translate_pending_events(
+                top_events = _ranking_top_events(events, bursts, cfg)
+                azure_key = (
+                    os.environ.get("AZURE_TRANSLATOR_KEY", "").strip()
+                    if tr_cfg.get("enabled")
+                    else ""
+                )
+                azure_region = (
+                    os.environ.get("AZURE_TRANSLATOR_REGION", "").strip()
+                    if tr_cfg.get("enabled")
+                    else ""
+                )
+                deepl_key = (
+                    os.environ.get("DEEPL_API_KEY", "").strip()
+                    if tr_cfg.get("enabled")
+                    else ""
+                )
+                azure_count, deepl_count = _translate_priority_texts(
                     conn,
                     events,
+                    top_events,
+                    bursts,
                     tr_cfg,
-                    deepl_key=deepl_key if deepl_due else None,
-                    deepl_chars_budget=translate_mod.DEEPL_MAX_CHARS_PER_ROUND - deepl_chars_used,
-                    deepl_exhausted=deepl_exhausted,
+                    azure_key,
+                    azure_region,
+                    deepl_key,
+                    db_path,
                 )
-                counts["deepl_translated"] = deepl_count + deepl_event_count
+                counts["azure_translated"] = azure_count
+                counts["deepl_translated"] = deepl_count
             except Exception as exc:
-                logger.warning("事件名翻译失败（不影响采集）: %s", exc)
-            bursts = detect_bursts(conn, thresholds=cfg.get("burst"))
+                logger.warning("优先翻译失败（不影响采集）: %s", exc)
             counts["events"] = len(events)
             counts["bursts"] = len(bursts)
             if bursts:
