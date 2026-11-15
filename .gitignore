@@ -221,8 +221,13 @@ __marimo__/
 
 # Global Trend Radar - project specific
 # 密钥与本地运行文件，绝不提交
+.env.*
+!.env.example
+data/*
+!data/.gitkeep
 data/*.sqlite3
 data/*.sqlite3-journal
 data/.youtube_last_run
 .streamlit/
 .DS_Store
+nohup.out
