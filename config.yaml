@@ -130,7 +130,7 @@ telegram:
 muse_chat:
   enabled: true
   url_match: "muse.ai"
-  method: auto  # auto | applescript | cdp；auto = macOS 用 AppleScript，Windows 用 CDP
+  method: auto  # auto | applescript | cdp | safari；auto = macOS 用 AppleScript，Windows 用 CDP；macOS 也可填 safari 走 Safari（2026-11-15 起 Chrome 的 AppleScript 在本机不可用，见 docs/MUSE_CHAT.md）
   cdp_port: 9222
 
 # 标题自动翻译：只翻优先内容（Top 5 事件名 + 爆发事件名 + 各事件最高分

@@ -6,8 +6,17 @@
 （见 format_muse_chat_message），一眼能认出是扫描器打的，不是
 用户自己敲的。
 
-两个平台，一段 JS：
-- macOS：AppleScript（系统自带，不用装东西、不用重启 Chrome）。
+三条入口，一段 JS：
+- macOS（推荐）：Safari。AppleScript 的 do JavaScript 是 Safari
+  原生支持的，不走 Chrome 的桥；Safari 里打开 Muse 对话标签页，
+  菜单栏 Develop（开发）→ Allow JavaScript from Apple Events 要
+  勾选，首次运行还会在系统设置 → 隐私与安全性 → 自动化里弹一次
+  权限（允许扫描器控制 Safari）。
+- macOS：Chrome + AppleScript（系统自带，不用装东西、不用重启
+  Chrome）。2026-11-15 实测：这条路在这台 Mac 上已坏掉——Chrome
+  开关开着、模板改成序号定位，execute javascript 仍报 -1700；
+  CDP 的 9222 端口带参数启动后也不监听。所以 macOS 当前可用的
+  是 Safari，Chrome 两条路保留作备用。
   首次运行 macOS 会弹权限：系统设置 → 隐私与安全性 → 自动化，
   允许扫描器（终端 / Python）控制 Google Chrome。
   另外 Chrome 菜单栏 → View（视图）→ Developer（开发者）→
@@ -234,6 +243,35 @@ end run
 """
 
 
+# ---------------------------------------------------------------------------
+# macOS：Safari。do JavaScript 是 Safari 原生支持的，不走 Chrome 的
+# AppleScript 桥（2026-11-15 实测 Chrome 的桥在这台 Mac 上坏掉，
+# 与这条路无关）。其余与 Chrome 模板一致：JS 写临时文件、序号定位。
+# 注意：Safari 的 AppleScript 只看当前标签页组里的标签页，Muse
+# 对话要放在当前打开的标签页组里，见 docs/MUSE_CHAT.md。
+# ---------------------------------------------------------------------------
+SAFARI_APPLESCRIPT_TEMPLATE = """on run argv
+  set jsPath to item 1 of argv
+  set urlMatch to item 2 of argv
+  set jsCode to read POSIX file jsPath as «class utf8»
+  if application "Safari" is not running then
+    return "NO_SAFARI"
+  end if
+  tell application "Safari"
+    -- 同样用显式序号定位标签页（与 Chrome 模板同理）。
+    repeat with wi from 1 to count of windows
+      repeat with ti from 1 to count of tabs of window wi
+        if (URL of tab ti of window wi) contains urlMatch then
+          return do JavaScript jsCode in tab ti of window wi
+        end if
+      end repeat
+    end repeat
+  end tell
+  return "NO_TAB"
+end run
+"""
+
+
 def _looks_like_permission_denied(stderr: str) -> bool:
     """osascript 报错里是不是 macOS 自动化权限没给。"""
     lowered = (stderr or "").lower()
@@ -265,6 +303,23 @@ def _looks_like_js_blocked(stderr: str) -> bool:
             "type specifier",
             "allow javascript",
         )
+    )
+
+
+def _looks_like_safari_js_blocked(stderr: str) -> bool:
+    """osascript 报错里是不是 Safari 没开 JavaScript from Apple Events。
+
+    与 Chrome 的 _looks_like_js_blocked 同理，先于自动化权限检查：
+    Safari 菜单栏 Develop → Allow JavaScript from Apple Events 没勾，
+    do JavaScript 会被挡。命中条件（小写后匹配）：含 "allow
+    javascript"，或同时含 "javascript" 与 "not allowed" /
+    "not permitted" / "denied" 任一。
+    """
+    lowered = (stderr or "").lower()
+    if "allow javascript" in lowered:
+        return True
+    return "javascript" in lowered and any(
+        token in lowered for token in ("not allowed", "not permitted", "denied")
     )
 
 
@@ -309,6 +364,56 @@ def _send_via_applescript(text: str, url_match: str) -> dict:
         return {"ok": False, "reason": "bad_js_result", "detail": out[:200]}
     if isinstance(result, dict) and result.get("ok"):
         return {"ok": True, "method": "applescript", "detail": result}
+    reason = result.get("reason", "js_failed") if isinstance(result, dict) else "js_failed"
+    return {"ok": False, "reason": reason, "detail": str(result)[:200]}
+
+
+def _send_via_safari(text: str, url_match: str) -> dict:
+    """macOS：osascript 找 Safari 里含 url_match 的标签页，执行 JS。
+
+    与 _send_via_applescript 同一套流程（临时文件 + osascript +
+    30 秒超时），只是模板换成 Safari 的 do JavaScript。Safari 的
+    JS 被禁先于自动化权限检查（见 _looks_like_safari_js_blocked）。
+    """
+    js = build_js_payload(text)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            js_path = Path(tmp) / "muse_chat_payload.js"
+            scpt_path = Path(tmp) / "muse_chat_send.scpt"
+            js_path.write_text(js, encoding="utf-8")
+            scpt_path.write_text(SAFARI_APPLESCRIPT_TEMPLATE, encoding="utf-8")
+            proc = subprocess.run(
+                ["osascript", str(scpt_path), str(js_path), url_match],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "reason": "applescript_timeout"}
+    except FileNotFoundError:
+        return {"ok": False, "reason": "osascript_missing"}
+    except OSError as exc:
+        return {"ok": False, "reason": "applescript_error", "detail": str(exc)[:200]}
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        if _looks_like_safari_js_blocked(err):
+            reason = "safari_js_blocked"
+        elif _looks_like_permission_denied(err):
+            reason = "automation_denied"
+        else:
+            reason = "applescript_error"
+        return {"ok": False, "reason": reason, "detail": err[:300]}
+    if out == "NO_SAFARI":
+        return {"ok": False, "reason": "safari_not_running"}
+    if out == "NO_TAB":
+        return {"ok": False, "reason": "no_muse_tab"}
+    try:
+        result = json.loads(out)
+    except ValueError:
+        return {"ok": False, "reason": "bad_js_result", "detail": out[:200]}
+    if isinstance(result, dict) and result.get("ok"):
+        return {"ok": True, "method": "safari", "detail": result}
     reason = result.get("reason", "js_failed") if isinstance(result, dict) else "js_failed"
     return {"ok": False, "reason": reason, "detail": str(result)[:200]}
 
@@ -376,8 +481,10 @@ def _send_via_cdp(text: str, url_match: str, port: int = DEFAULT_CDP_PORT) -> di
 # 入口：方法选择 + 失败提示。
 # ---------------------------------------------------------------------------
 def _resolve_method(method: str | None, platform_name: str | None = None) -> str:
-    """method: auto | applescript | cdp。auto 按平台选；其他平台返回
-    unsupported（本机 Linux 就是，模块照常 import、测试照常跑）。"""
+    """method: auto | applescript | cdp | safari。auto 按平台选
+    （macOS 走 applescript，Windows 走 cdp）；safari 只在 macOS
+    上可用；其他平台返回 unsupported（本机 Linux 就是，模块照常
+    import、测试照常跑）。"""
     chosen = (method or "auto").strip().lower()
     if chosen == "auto":
         plat = platform_name or sys.platform
@@ -386,24 +493,35 @@ def _resolve_method(method: str | None, platform_name: str | None = None) -> str
         if plat == "win32":
             return "cdp"
         return "unsupported"
+    if chosen == "safari":
+        plat = platform_name or sys.platform
+        return "safari" if plat == "darwin" else "unsupported"
     if chosen in ("applescript", "cdp"):
         return chosen
     return "unsupported"
 
 
-def _log_send_failure(result: dict) -> None:
-    """按失败原因给一条人能看懂的提示（不含任何凭证，消息正文也不进日志）。"""
+def _log_send_failure(result: dict, method: str | None = None) -> None:
+    """按失败原因给一条人能看懂的提示（不含任何凭证，消息正文也不进日志）。
+
+    method 只影响 no_muse_tab 的提示：Safari 路径说 Safari，Chrome
+    路径说 Chrome，不传时默认 Chrome 的说法（老调用方不受影响）。
+    """
     reason = result.get("reason", "unknown")
     hints = {
         "chrome_not_running": "Chrome 未运行：打开 Chrome 并登录 Muse 对话后，下一轮会自动再试",
+        "safari_not_running": "Safari 未运行：打开 Safari 并登录 Muse 对话后，下一轮会自动再试",
         "no_muse_tab": "未找到 Muse 对话标签页：请在 Chrome 里打开 Muse 对话（URL 含 muse.ai），下一轮自动再试",
         "automation_denied": "macOS 未允许自动化：系统设置 → 隐私与安全性 → 自动化，允许扫描器/终端控制 Google Chrome（见 docs/MUSE_CHAT.md）",
         "applescript_js_blocked": "Chrome 未开启 Apple Events 的 JavaScript 注入：Chrome 菜单栏 → View（视图）→ Developer（开发者）→ 勾选 Allow JavaScript from Apple Events（当前 Chrome 默认关闭，是 -1700 失败最常见的原因；与 macOS 自动化权限是两回事，两处都要开，见 docs/MUSE_CHAT.md）",
+        "safari_js_blocked": "Safari 未开启 Apple Events 的 JavaScript：Safari → 设置 → 高级 → 勾选“在菜单栏中显示开发菜单”，然后菜单栏 Develop（开发）→ 勾选 Allow JavaScript from Apple Events（见 docs/MUSE_CHAT.md）",
         "cdp_unreachable": "连不上 Chrome 调试端口：请完全退出 Chrome 后加 --remote-debugging-port=9222 重开（见 docs/MUSE_CHAT.md）",
         "websocket_client_missing": "缺少 websocket-client：运行 pip install -r requirements.txt（或重跑安装脚本）",
         "unsupported_platform": "当前平台不支持浏览器输入（仅 macOS / Windows）",
     }
     hint = hints.get(reason)
+    if reason == "no_muse_tab" and method == "safari":
+        hint = "未找到 Muse 对话标签页：请在 Safari 里打开 Muse 对话（URL 含 muse.ai），下一轮自动再试"
     if hint:
         logger.warning("Muse 对话提醒未发送（%s）：%s", reason, hint)
     else:
@@ -422,6 +540,8 @@ def send_to_muse_chat(text: str, muse_cfg: dict | None = None) -> dict:
         return {"ok": False, "reason": "unsupported_platform"}
     if method == "applescript":
         result = _send_via_applescript(text, url_match)
+    elif method == "safari":
+        result = _send_via_safari(text, url_match)
     else:
         try:
             port = int(cfg.get("cdp_port", DEFAULT_CDP_PORT) or DEFAULT_CDP_PORT)
@@ -431,7 +551,7 @@ def send_to_muse_chat(text: str, muse_cfg: dict | None = None) -> dict:
     if result.get("ok"):
         logger.info("Muse 对话提醒已发送（%s）", result.get("method"))
     else:
-        _log_send_failure(result)
+        _log_send_failure(result, method)
     return result
 
 
@@ -494,7 +614,7 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="测试：把一条消息打进本机 Chrome 里的 Muse 对话输入框并发送。"
+        description="测试：把一条消息打进本机浏览器（Chrome 或 Safari）里的 Muse 对话输入框并发送。"
     )
     parser.add_argument(
         "--test",
@@ -503,7 +623,7 @@ def main(argv: list[str] | None = None) -> int:
         help="要发送的测试文本（默认一条无害的测试消息）",
     )
     parser.add_argument("--url-match", default=DEFAULT_URL_MATCH, help="标签页 URL 匹配串（默认 muse.ai）")
-    parser.add_argument("--method", default="auto", help="auto | applescript | cdp（默认 auto）")
+    parser.add_argument("--method", default="auto", help="auto | applescript | cdp | safari（默认 auto）")
     parser.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT, help="CDP 端口（默认 9222）")
     args = parser.parse_args(argv)
     cfg = {"url_match": args.url_match, "method": args.method, "cdp_port": args.cdp_port}
@@ -519,7 +639,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"结果：未发送（{result.get('reason', 'unknown')}）")
     if result.get("detail"):
         print(f"详情：{result['detail']}")
-    print("排查见 docs/MUSE_CHAT.md（macOS 看自动化权限和 Chrome 的 Allow JavaScript from Apple Events，Windows 看 Chrome 调试端口）。")
+    print("排查见 docs/MUSE_CHAT.md（macOS 看自动化权限、Chrome 的 Allow JavaScript from Apple Events 或 Safari 的 Develop 设置，Windows 看 Chrome 调试端口）。")
     return 1
 
 

@@ -450,5 +450,133 @@ class TestCli(unittest.TestCase):
             self.assertEqual(muse_chat.main(["--test", "hi"]), 1)
 
 
+
+class TestSafariTemplate(unittest.TestCase):
+    def test_template_uses_do_javascript_and_index_specifiers(self):
+        tpl = muse_chat.SAFARI_APPLESCRIPT_TEMPLATE
+        self.assertIn("do JavaScript jsCode in tab ti of window wi", tpl)
+        self.assertIn("repeat with wi from 1 to count of windows", tpl)
+        self.assertIn("repeat with ti from 1 to count of tabs of window wi", tpl)
+        self.assertIn("NO_SAFARI", tpl)
+        self.assertIn("NO_TAB", tpl)
+        self.assertIn("Safari", tpl)
+        self.assertNotIn("Google Chrome", tpl)
+        self.assertNotIn("execute javascript", tpl)
+
+
+class TestSafariSend(unittest.TestCase):
+    def _run(self, stdout="", returncode=0, stderr="", side_effect=None):
+        proc = mock.Mock()
+        proc.stdout = stdout
+        proc.stderr = stderr
+        proc.returncode = returncode
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            if side_effect is not None:
+                raise side_effect
+            captured["cmd"] = cmd
+            captured["js"] = Path(cmd[2]).read_text(encoding="utf-8")
+            captured["scpt"] = Path(cmd[1]).read_text(encoding="utf-8")
+            return proc
+
+        with mock.patch("trend_radar.muse_chat.subprocess.run", side_effect=fake_run):
+            result = muse_chat._send_via_safari("hello 提醒", "muse.ai")
+        return result, captured
+
+    def test_success_and_script_contents(self):
+        result, captured = self._run(
+            stdout='{"ok": true, "input": "textarea", "submitted": "button"}'
+        )
+        self.assertEqual(result, {"ok": True, "method": "safari", "detail": {"ok": True, "input": "textarea", "submitted": "button"}})
+        self.assertEqual(captured["cmd"][0], "osascript")
+        self.assertEqual(captured["cmd"][3], "muse.ai")
+        self.assertIn("hello 提醒", captured["js"])
+        self.assertIn("do JavaScript", captured["scpt"])
+        self.assertNotIn("Google Chrome", captured["scpt"])
+
+    def test_no_safari(self):
+        result, _ = self._run(stdout="NO_SAFARI")
+        self.assertEqual(result, {"ok": False, "reason": "safari_not_running"})
+
+    def test_no_tab(self):
+        result, _ = self._run(stdout="NO_TAB")
+        self.assertEqual(result, {"ok": False, "reason": "no_muse_tab"})
+
+    def test_js_blocked_allow_javascript(self):
+        result, _ = self._run(
+            stdout="", returncode=1,
+            stderr="Safari got an error: Allow JavaScript from Apple Events is not enabled",
+        )
+        self.assertEqual(result["reason"], "safari_js_blocked")
+
+    def test_js_blocked_javascript_not_permitted(self):
+        result, _ = self._run(
+            stdout="", returncode=1,
+            stderr="JavaScript execution is not permitted from Apple events",
+        )
+        self.assertEqual(result["reason"], "safari_js_blocked")
+
+    def test_permission_denied_without_javascript_word(self):
+        result, _ = self._run(
+            stdout="", returncode=1, stderr="Safari got an error: not allowed to send Apple events"
+        )
+        self.assertEqual(result["reason"], "automation_denied")
+
+    def test_looks_like_safari_js_blocked(self):
+        self.assertTrue(muse_chat._looks_like_safari_js_blocked("Allow JavaScript from Apple Events"))
+        self.assertTrue(muse_chat._looks_like_safari_js_blocked("javascript not allowed"))
+        self.assertTrue(muse_chat._looks_like_safari_js_blocked("JavaScript is denied"))
+        self.assertFalse(muse_chat._looks_like_safari_js_blocked("not allowed to send Apple events"))
+        self.assertFalse(muse_chat._looks_like_safari_js_blocked("something else broke"))
+
+    def test_hints_mention_safari(self):
+        with self.assertLogs(muse_chat.logger, level="WARNING") as logs:
+            muse_chat._log_send_failure({"reason": "safari_js_blocked"})
+            muse_chat._log_send_failure({"reason": "safari_not_running"})
+            muse_chat._log_send_failure({"reason": "no_muse_tab"}, method="safari")
+            muse_chat._log_send_failure({"reason": "no_muse_tab"}, method="applescript")
+        combined = "\n".join(logs.output)
+        self.assertIn("Safari", combined)
+        self.assertIn("Allow JavaScript from Apple Events", combined)
+        self.assertIn("开发菜单", combined)
+        self.assertIn("请在 Safari 里打开 Muse 对话", combined)
+        self.assertIn("请在 Chrome 里打开 Muse 对话", combined)
+
+    def test_timeout(self):
+        result, _ = self._run(side_effect=subprocess.TimeoutExpired("osascript", 30))
+        self.assertEqual(result, {"ok": False, "reason": "applescript_timeout"})
+
+
+class TestSafariResolveMethod(unittest.TestCase):
+    def test_safari_method(self):
+        self.assertEqual(muse_chat._resolve_method("safari", "darwin"), "safari")
+        self.assertEqual(muse_chat._resolve_method("safari", "win32"), "unsupported")
+        self.assertEqual(muse_chat._resolve_method("safari", "linux"), "unsupported")
+        self.assertEqual(muse_chat._resolve_method("auto", "darwin"), "applescript")
+        self.assertEqual(muse_chat._resolve_method("auto", "win32"), "cdp")
+
+
+class TestSafariCli(unittest.TestCase):
+    def test_main_safari(self):
+        with (
+            mock.patch.object(
+                muse_chat,
+                "send_to_muse_chat",
+                mock.Mock(
+                    return_value={
+                        "ok": True,
+                        "method": "safari",
+                        "detail": {"input": "textarea", "submitted": "button"},
+                    }
+                ),
+            ) as send,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(muse_chat.main(["--test", "x", "--method", "safari"]), 0)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[1].get("method"), "safari")
+
+
 if __name__ == "__main__":
     unittest.main()
