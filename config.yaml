@@ -131,6 +131,12 @@ translation:
   # 两次翻译接口调用之间等 0.5 秒：免费接口对连续请求很敏感，
   # 30 条连发容易直接 429；慢一点反而更容易翻出来。失败不存 title_zh，
   # 下一轮会再试（见 collector.py）；中文标题不调接口、不占预算。
+  # DeepL 免费 API（见 docs/TRANSLATION.md）：每小时最多 1 次 DeepL 轮次，
+  # 每轮最多翻 deepl_max_per_round 个分数最高的标题 + 10 个事件名；
+  # 免费额度：旧版 API Free 每月 50 万字符，新注册的 Developer 计划为
+  # 一次性 100 万字符（用完不恢复）；另有每轮 660 字符硬上限兜底。
+  # key 放本地 .env（DEEPL_API_KEY），没 key 时不走 DeepL，只用 gtx 端点。
+  deepl_max_per_round: 1
 
 # P1 事件聚类 v0.1（本地 TF-IDF + 余弦相似度 + 并查集，无新依赖）
 # similarity_threshold 是初始假设，需用真实多平台数据校准，见 docs/P1_CLUSTERING.md

@@ -68,6 +68,16 @@ def _sanitize(text: str, token: str) -> str:
     return text
 
 
+def _normalize_name(burst: dict) -> str:
+    """爆发事件的去重键：显示名（中文名优先）小写、去首尾空白、空白折叠。
+
+    同一标题的直播/滚动新闻可能在同一轮里分成多个事件（不同 URL、
+    不同成员标题），名字归一化后相同就是同一条提醒，不应重复发。
+    """
+    name = burst.get("name_zh") or burst.get("name") or ""
+    return " ".join(str(name).lower().split())
+
+
 def send_burst_alerts(
     bursts: list[dict] | None,
     bot_token: str | None = None,
@@ -80,20 +90,42 @@ def send_burst_alerts(
     TELEGRAM_CHAT_ID。两者缺任何一个时不发任何请求，返回
     {"sent": 0, "skipped": len(bursts), "errors": []}。
 
+    去重：同一轮里归一化后名字相同的爆发只发第一条（2026-11-15 实测：
+    同一个马拉雅拉姆语小时直播标题在一轮里分成了 3 个事件、发了 3 条
+    一模一样的提醒）。只去重，不改爆发检测规则、不改事件 ID 生成。
+
     一条失败不影响其他条：失败记进 errors 并记 warning，函数本身
     不抛异常。返回 {"sent": n, "skipped": m, "errors": [...]}，
-    其中 errors 每项是 {"event_id": ..., "error": ...}，error 里不含 token。
+    其中 errors 每项是 {"event_id": ..., "error": ...}，error 里不含 token；
+    skipped 包含去重掉的条数（没发出去的都算 skipped）。
     """
     bursts = list(bursts or [])
+    total = len(bursts)
+    seen_names: set[str] = set()
+    unique_bursts: list[dict] = []
+    for burst in bursts:
+        key = _normalize_name(burst)
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        unique_bursts.append(burst)
+    if len(unique_bursts) != total:
+        logger.info(
+            "Telegram 提醒去重：%d 条爆发里 %d 条与前一条同名，只发 %d 条",
+            total,
+            total - len(unique_bursts),
+            len(unique_bursts),
+        )
+    bursts = unique_bursts
     token = (bot_token or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
     chat = (chat_id or os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
     if not token or not chat:
         if bursts:
             logger.info(
                 "Telegram 未配置：未设置 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，跳过 %d 条提醒",
-                len(bursts),
+                total,
             )
-        return {"sent": 0, "skipped": len(bursts), "errors": []}
+        return {"sent": 0, "skipped": total, "errors": []}
 
     url = f"{API_BASE}/bot{token}/sendMessage"
     sent = 0
@@ -121,4 +153,4 @@ def send_burst_alerts(
             continue
         sent += 1
         logger.info("Telegram 提醒已发送（事件 %s）", event_id)
-    return {"sent": sent, "skipped": len(bursts) - sent - len(errors), "errors": errors}
+    return {"sent": sent, "skipped": total - sent - len(errors), "errors": errors}

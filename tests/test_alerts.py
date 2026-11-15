@@ -19,10 +19,10 @@ TOKEN = "123456:TEST-TOKEN-abcdef"
 CHAT_ID = "987654321"
 
 
-def _burst(event_id="evt_abc123", reasons=("growth_spike", "score_surge")):
+def _burst(event_id="evt_abc123", reasons=("growth_spike", "score_surge"), name=None):
     return {
         "event_id": event_id,
-        "name": "Kanak News 2PM Headlines",
+        "name": name or "Kanak News 2PM Headlines",
         "reasons": list(reasons),
         "current": {
             "collected_at": "2026-11-15T13:18:00+00:00",
@@ -151,7 +151,12 @@ class TestSendBurstAlerts(unittest.TestCase):
         ok_resp = mock.Mock(status_code=200)
         ok_resp.json.return_value = {"ok": True}
         bad_resp = mock.Mock(status_code=403)
-        bursts = [_burst("evt_1"), _burst("evt_2"), _burst("evt_3")]
+        # 三个不同名字的爆发：去重不应把它们并成一条。
+        bursts = [
+            _burst("evt_1", name="Event One"),
+            _burst("evt_2", name="Event Two"),
+            _burst("evt_3", name="Event Three"),
+        ]
         with mock.patch.dict(
             os.environ, {"TELEGRAM_BOT_TOKEN": TOKEN, "TELEGRAM_CHAT_ID": CHAT_ID}, clear=True
         ), mock.patch(
@@ -176,6 +181,82 @@ class TestSendBurstAlerts(unittest.TestCase):
             result = send_burst_alerts([])
         post.assert_not_called()
         self.assertEqual(result, {"sent": 0, "skipped": 0, "errors": []})
+
+
+class TestSendBurstAlertsDedup(unittest.TestCase):
+    """去重：同一轮里归一化后名字相同的爆发只发第一条（2026-11-15 实测：
+    同一个马拉雅拉姆语小时直播标题在一轮里分成了 3 个事件、发了 3 条
+    一模一样的提醒）。"""
+
+    def _send(self, bursts):
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"ok": True}
+        env = {"TELEGRAM_BOT_TOKEN": TOKEN, "TELEGRAM_CHAT_ID": CHAT_ID}
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch("trend_radar.alerts.requests.post", return_value=resp) as post,
+        ):
+            result = send_burst_alerts(bursts)
+        return result, post
+
+    def test_same_name_three_bursts_one_alert(self):
+        name = "Today Breaking News LIVE | Top Headlines Of The Hour | 15.11.2026"
+        bursts = [
+            _burst("evt_1", reasons=("new_multi_platform",), name=name),
+            _burst("evt_2", reasons=("new_multi_platform",), name=name),
+            _burst("evt_3", reasons=("new_multi_platform",), name=name),
+        ]
+        result, post = self._send(bursts)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(result["skipped"], 2)  # 去重掉的 2 条算 skipped
+        self.assertEqual(result["errors"], [])
+        # 发的是第一条（事件 ID 保留第一个）。
+        self.assertIn("evt_1", post.call_args.kwargs["json"]["text"])
+
+    def test_different_names_all_sent(self):
+        bursts = [
+            _burst("evt_1", name="Event One"),
+            _burst("evt_2", name="Event Two"),
+            _burst("evt_3", name="Event Three"),
+        ]
+        result, post = self._send(bursts)
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(result["sent"], 3)
+        self.assertEqual(result["skipped"], 0)
+
+    def test_same_name_different_case_and_whitespace_one_alert(self):
+        bursts = [
+            _burst("evt_1", name="  Today Breaking News LIVE  "),
+            _burst("evt_2", name="today   breaking news live"),
+            _burst("evt_3", name="TODAY BREAKING NEWS LIVE"),
+        ]
+        result, post = self._send(bursts)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(result["skipped"], 2)
+
+    def test_name_zh_takes_precedence_for_dedup(self):
+        # 原名不同、中文名相同：显示用的中文名相同，仍只发一条。
+        b1 = _burst("evt_1", name="Original Title A")
+        b1["name_zh"] = "今日突发新闻"
+        b2 = _burst("evt_2", name="Original Title B")
+        b2["name_zh"] = "今日突发新闻"
+        result, post = self._send([b1, b2])
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(result["sent"], 1)
+
+    def test_dedup_keeps_first_occurrence_order(self):
+        bursts = [
+            _burst("evt_1", name="Shared Name"),
+            _burst("evt_2", name="Other Event"),
+            _burst("evt_3", name="Shared Name"),
+        ]
+        result, post = self._send(bursts)
+        self.assertEqual(post.call_count, 2)
+        texts = [c.kwargs["json"]["text"] for c in post.call_args_list]
+        self.assertIn("evt_1", texts[0])
+        self.assertIn("evt_2", texts[1])
 
 
 if __name__ == "__main__":
