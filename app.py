@@ -9,7 +9,13 @@ from pathlib import Path
 
 import streamlit as st
 
-from trend_radar.dashboard_data import load_bursts, load_fastest, load_history, load_items
+from trend_radar.dashboard_data import (
+    load_bursts,
+    load_fastest,
+    load_history,
+    load_items,
+    load_top_events,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "trends.sqlite3"
@@ -29,6 +35,35 @@ if not items:
         "等一轮采集完成后再刷新本页。"
     )
     st.stop()
+
+st.subheader("🏆 最热事件 Top 10（综合排名：增长 + 成员强度 + 爆发 + 跨平台 + 新鲜度）")
+try:
+    top_events = load_top_events(DB_PATH)
+except Exception:  # 排名失败不影响已有榜单
+    top_events = []
+if not top_events:
+    st.info("暂无最热事件：需要先跑一轮采集并聚出事件。")
+else:
+    st.dataframe(
+        [
+            {
+                "排名": i + 1,
+                "事件": ev.get("name", ""),
+                "综合分": round(float(ev.get("rank_score") or 0), 1),
+                "平台数": ev.get("platform_count", 0),
+                "平台": ", ".join(ev.get("platforms", [])),
+                "最大增长/小时": ev.get("max_growth", 0),
+                "原因": " · ".join(ev.get("rank_reasons") or []),
+            }
+            for i, ev in enumerate(top_events)
+        ],
+        width="stretch",
+    )
+    st.caption(
+        "综合分 0-100：增长 30%、成员强度 20%、爆发 20%、跨平台 20%、"
+        "新鲜度 10%（半衰期 24 小时），分量在本批事件内相对归一化。"
+        "权重是初始假设，需用真实数据校准，见 docs/TOP_EVENTS.md。"
+    )
 
 st.subheader("🔥 实时热点榜（按综合热度分数排序，前 100 条）")
 st.dataframe(
@@ -89,11 +124,13 @@ else:
         f"最多 {len(series)} 条内容）。缺失的时间点表示该轮没有该内容的快照。"
     )
 
-st.subheader("🧩 跨平台事件（P1 v0.1：标题 TF-IDF 聚类）")
+st.subheader("🧩 跨平台事件（P1 v0.1 聚类，按综合分排序，与最热 Top 10 同序）")
 try:
     from trend_radar.clustering import cluster_from_db
 
-    events = cluster_from_db(DB_PATH, hours=24)
+    # 正常情况直接用上面已排好的 Top 事件（带 rank_score）；只有排名
+    # 失败时才回退到聚类的原始顺序，保证这一节永远和 Top 10 同序。
+    events = top_events or cluster_from_db(DB_PATH, hours=24)
 except Exception as exc:  # 聚类失败不影响已有榜单
     events = []
     st.info(f"事件聚类暂不可用：{exc}")
@@ -104,6 +141,7 @@ else:
         [
             {
                 "事件": ev.get("name_zh") or ev.get("name", ""),
+                "综合分": ev.get("rank_score", "—"),
                 "平台数": ev.get("platform_count", 0),
                 "平台": ", ".join(ev.get("platforms", [])),
                 "条数": ev.get("item_count", 0),

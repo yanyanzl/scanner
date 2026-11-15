@@ -164,6 +164,46 @@ def _history_series(
     return times, series
 
 
+def load_top_events(db_path: str | Path, limit: int | None = None) -> list[dict]:
+    """取综合排名最靠前的事件（Top N，见 trend_radar/event_ranking.py）。
+
+    读最近 24 小时的聚类事件 + 本轮爆发列表，按综合分排序。
+    事件名优先显示中文名（app.py 直接读 ev["name"]，这里替换就不用改
+    app.py）；原名保留在 name_original 里。
+
+    缺 DB、没事件、或内部任何一步失败时返回 []，不抛异常。
+    limit 为 None 时用 config.yaml 的 ranking.top_n（默认 10）。
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    try:
+        from trend_radar.clustering import cluster_from_db
+        from trend_radar.event_ranking import load_ranking_config, rank_events
+
+        cfg = load_ranking_config()
+        top_n = int(limit) if limit is not None else int(cfg.get("top_n", 10))
+        events = cluster_from_db(db_path, hours=24)
+        if not events:
+            return []
+        bursts = load_bursts(db_path)
+        ranked = rank_events(
+            events,
+            bursts=bursts,
+            weights=cfg.get("weights"),
+            freshness_half_life_hours=cfg.get("freshness_half_life_hours"),
+        )
+        for ev in ranked:
+            name_zh = (ev.get("name_zh") or "").strip()
+            if name_zh and name_zh != ev.get("name"):
+                ev["name_original"] = ev.get("name", "")
+                ev["name"] = name_zh
+        return ranked[: max(1, top_n)]
+    except Exception as exc:  # 排名失败不影响 Dashboard 其余各节
+        logger.warning("加载最热事件失败：%s", exc)
+        return []
+
+
 def load_bursts(db_path: str | Path) -> list[dict]:
     """取当前爆发的事件（P2 准备，见 trend_radar/burst.py）。
 

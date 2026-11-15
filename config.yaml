@@ -88,3 +88,16 @@ burst:
   score_multiplier: 2.0
   score_min_delta: 5.0
   new_event_min_platforms: 2
+
+# 事件综合排名 Top N（聚合所有来源成一个榜，见 docs/TOP_EVENTS.md）：
+# Dashboard 最上方显示。权重与半衰期都是初始假设，需用 1-2 周真实
+# 数据校准；改权重不用改代码，改这里就行。没有这一节时用模块默认值。
+ranking:
+  top_n: 10
+  weights:
+    growth: 0.30
+    member_strength: 0.20
+    burst: 0.20
+    cross_platform: 0.20
+    novelty: 0.10
+  freshness_half_life_hours: 24
