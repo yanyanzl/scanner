@@ -1,6 +1,7 @@
 # Global Trend Radar 配置
 # 扫描间隔（分钟），Windows / macOS 本地运行，默认 15 分钟
-# 免费优先：默认只启用 RSS + GDELT；其他来源需配置凭证后手动开启，
+# 免费优先：默认启用 RSS；GDELT 已停用（见下）；新闻 API 与
+# Reddit/YouTube 需配置凭证后自动采集，无凭证时显示未启用。
 # 付费来源（X）只有在没有免费可选方案时才考虑开启。
 scan_interval_minutes: 15
 db_path: "data/trends.sqlite3"
@@ -13,6 +14,18 @@ weights:
   cross_platform: 0.20
   novelty: 0.10
 
+# 搜索主题（见 docs/TOPICS.md）：所有需要关键词的来源共用——
+# Google News / Bing RSS 搜索 feed、免费新闻 API、GDELT 查询词。
+# 全部是英文关键词（所有来源都是英文内容，中文关键词匹配不到东西）。
+# 改主题不用改代码：改这里，重启扫描器即可。
+# YouTube 不走这里：搜索桶 100 次/天，最多 2 个查询词（见下文 youtube）。
+topics:
+  breaking: ["breaking news"]  # 突发最热
+  economy: ["stock market OR inflation OR interest rates"]  # 经济金融
+  tech: ["technology"]  # 科技
+  ai: ["artificial intelligence OR AI"]  # AI
+  politics: ["war OR geopolitics"]  # 全球政治与冲突
+
 sources:
   rss:
     enabled: true
@@ -22,14 +35,13 @@ sources:
     # 可能出现两次，聚类会把它们并成一个事件。
     # 未加入的：路透社 rssFeed 返回 401（可能挡云服务器 IP，用户 Mac
     # 上浏览器能打开的话可以再加）、美联社 apnews.com/rss 连接失败。
+    # aggregators: true 时，Google News（头条 + 每个主题 1 个搜索 feed）
+    # 与 Bing（每个主题 1 个搜索 feed）由 topics 现场生成，见
+    # trend_radar/topics.py；false 则只采下面列出的出版商 feed。
+    aggregators: true
     feeds:
       - "https://feeds.bbci.co.uk/news/world/rss.xml"
       - "https://feeds.bbci.co.uk/news/technology/rss.xml"
-      # Google News（聚合源）：突发与科技各一
-      - "https://news.google.com/rss/search?q=breaking%20news&hl=en-GB&gl=GB&ceid=GB:en"
-      - "https://news.google.com/rss/search?q=technology&hl=en-GB&gl=GB&ceid=GB:en"
-      # Bing News（聚合源）：突发
-      - "https://www.bing.com/news/search?q=breaking+news&format=rss"
       # 综合新闻
       - "https://www.aljazeera.com/xml/rss/all.xml"
       # 科技
@@ -43,9 +55,9 @@ sources:
     # 都已排除，是 GDELT 服务端过载主动丢请求（见 docs/GDELT 研究）。
     # 停用后每轮不再浪费重试时间；GDELT 本来就没有互动量数据，停用
     # 对增长计算没有损失。以后想再试：把下面改回 true 即可；先在
-    # 浏览器打开窄查询地址确认返回 JSON 再开。
+    # 浏览器打开窄查询地址确认返回 JSON 再开。重开时查询词由 topics
+    # 自动拼成（见 trend_radar/topics.py），这里不用写 query。
     enabled: false
-    query: "technology OR breaking news"
     max_records: 50
     # GDELT 单独放宽到每 60 分钟 1 次（不是每 15 分钟）：2026-11-15 连续 3 次
     # 失败（两次 HTTP 429、一次返回限流提示文本而非 JSON），见
@@ -61,7 +73,12 @@ sources:
     enabled: true  # 已开启：无凭证时 adapter 返回 [] 并记“未启用”，填好 YOUTUBE_API_KEY 后自动采集
     queries:
       - "breaking news"
-      - "technology"
+      - "artificial intelligence"
+    # 2026-11-15 用户决定：technology → artificial intelligence。AI 是
+    # 明确的优先方向，纯 AI 视频的标题不一定带 technology 这个词；
+    # 通用科技内容仍由 TechCrunch / Verge / Hacker News RSS 与 Google
+    # News 科技搜索 feed 覆盖。用精确短语，不用 OR 写法（YouTube 搜索
+    # 不支持 OR；OR 写法只适合 Google/Bing 等支持 OR 的来源）。
     # YouTube 单独放宽到每 30 分钟 1 次（不是每 15 分钟）：2 个查询词 × 48 次/天 = 96 次搜索/天，
     # 搜索桶上限是 100 次/天（Google 官方配额，2026-06-01 起 search.list 单独成桶、每次 1 单位），留 4 次缓冲。
     # videos.list 每次 1 单位，共用池 10,000 units/天，96 次只占 96 units。配额每天太平洋时间午夜重置。
@@ -74,6 +91,26 @@ sources:
   tiktok:
     enabled: false  # 需要官方授权数据接口，当前为预留 stub，不采集
     queries: []
+  # 免费新闻 API（见 docs/NEWS_APIS.md）：查询词全部来自上面 topics
+  #（默认 5 个），每个来源单独限频；无 key 时返回 []、不发请求，
+  # 填好 key 后下一轮自动开始采集。启用的前提是 key 已填进本地 .env。
+  newsapi:
+    enabled: true  # NEWSAPI_KEY；免费 100 次/天、文章延迟约 24 小时、仅限开发测试
+    # 90 分钟 1 次：16 轮/天 × 5 个查询 = 80 次/天，余 20。
+    interval_minutes: 90
+  guardian:
+    enabled: true  # GUARDIAN_API_KEY；免费 500 次/天、1 次/秒、非商业用途
+    # 15 分钟 1 次：96 轮/天 × 5 个查询 = 480 次/天，余 20。
+    interval_minutes: 15
+  nyt:
+    enabled: true  # NYT_API_KEY；免费 500 次/天、5 次/分钟、非商业用途
+    # 15 分钟 1 次：96 轮/天 × 5 个查询 = 480 次/天，余 20；
+    # 每轮内两次调用之间隔 12 秒（见 adapters/nyt.py）。
+    interval_minutes: 15
+  newsdata:
+    enabled: true  # NEWSDATA_API_KEY；免费 200 credits/天、文章延迟 12 小时
+    # 45 分钟 1 次：32 轮/天 × 5 个查询 = 160 credits/天，余 40。
+    interval_minutes: 45
 
 # P3 Telegram 实时提醒（免费 Bot API）：爆发事件在 1 分钟内推送到 Telegram。
 # 凭证不放这里，放本地 .env：TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID。

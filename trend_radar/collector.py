@@ -12,8 +12,21 @@ from pathlib import Path
 import yaml
 
 from trend_radar import db as dbmod
+from trend_radar import downloads as downloads_mod
+from trend_radar import topics as topics_mod
 from trend_radar import translate as translate_mod
-from trend_radar.adapters import gdelt, reddit, rss, tiktok, x_api, youtube
+from trend_radar.adapters import (
+    gdelt,
+    guardian,
+    newsapi,
+    newsdata,
+    nyt,
+    reddit,
+    rss,
+    tiktok,
+    x_api,
+    youtube,
+)
 from trend_radar.scoring import parse_dt, score_item
 
 logger = logging.getLogger(__name__)
@@ -71,6 +84,29 @@ def _mark_youtube_run(state_path: Path, now: datetime | None = None) -> None:
     path = Path(state_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(now.isoformat(), encoding="utf-8")
+
+
+# 免费新闻 API 的默认采集间隔（分钟）：按各自免费额度算出，
+# 每个来源每轮调 topics 里的查询词（默认 5 个），见 docs/NEWS_APIS.md：
+# - newsapi：100 次/天，90 分钟 → 16 轮/天 × 5 = 80 次/天（余 20）。
+# - guardian：500 次/天，15 分钟 → 96 轮/天 × 5 = 480 次/天（余 20）。
+# - nyt：500 次/天、5 次/分钟，15 分钟 → 480 次/天（余 20）；
+#   另外每轮内两次调用之间隔 12 秒（见 adapters/nyt.py）。
+# - newsdata：200 credits/天，45 分钟 → 32 轮/天 × 5 = 160 credits/天（余 40）。
+_NEWS_API_DEFAULT_INTERVALS = {
+    "newsapi": 90,
+    "guardian": 15,
+    "nyt": 15,
+    "newsdata": 45,
+}
+
+# 免费新闻 API：模块、.env key 名。查询词全部来自 topics。
+_NEWS_APIS = (
+    ("newsapi", newsapi, "NEWSAPI_KEY"),
+    ("guardian", guardian, "GUARDIAN_API_KEY"),
+    ("nyt", nyt, "NYT_API_KEY"),
+    ("newsdata", newsdata, "NEWSDATA_API_KEY"),
+)
 
 
 # 事件名每轮最多调几次翻译接口（事件少，10 次足够）。
@@ -215,6 +251,17 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
     youtube_interval_minutes = int(youtube_cfg.get("interval_minutes", 60))
     youtube_interval_hours = max(youtube_interval_minutes / 60.0, 0.01)
     db_path = BASE_DIR / cfg.get("db_path", "data/trends.sqlite3")
+    # 搜索主题：所有需要关键词的来源共用（见 trend_radar/topics.py）。
+    topics = topics_mod.load_topics(cfg)
+
+    # 下载文件自动清理：data/downloads/ 里超过 1 小时的文件删掉
+    # （见 trend_radar/downloads.py）。失败不影响采集。
+    try:
+        cleaned = downloads_mod.cleanup_downloads(Path(db_path).parent / "downloads")
+        if cleaned:
+            logger.info("下载目录清理：删除 %d 个过期文件", cleaned)
+    except Exception as exc:
+        logger.warning("下载目录清理失败（不影响采集）: %s", exc)
 
     all_items: list[dict] = []
     counts: dict[str, int] = {}
@@ -229,7 +276,15 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
         all_items.extend(items)
 
     if sources.get("rss", {}).get("enabled", True):
-        run("rss", lambda: rss.fetch(sources["rss"].get("feeds", [])))
+        # RSS 出版商 feed（BBC 等）是配置里写死的；Google News / Bing
+        # 的搜索 feed 是从 topics 现场生成的（见 trend_radar/topics.py），
+        # 改主题不用改代码。aggregators: false 可以只保留出版商 feed。
+        rss_cfg = sources["rss"]
+        feeds = list(rss_cfg.get("feeds", []))
+        if rss_cfg.get("aggregators", True):
+            feeds += topics_mod.google_news_feed_urls(topics)
+            feeds += topics_mod.bing_news_feed_urls(topics)
+        run("rss", lambda: rss.fetch(feeds))
     # GDELT 单独间隔（默认 60 分钟，见 config.yaml）：2026-11-15 连续 3 次失败
     # （两次 429、一次返回限流提示文本而非 JSON），gdelt.py 里已加退避重试，
     # 这里再把频率从每 15 分钟降到每小时 1 次。GDELT 没有互动量数据，
@@ -240,7 +295,9 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
         gdelt_interval_minutes = int(gdelt_cfg.get("interval_minutes", 60))
         gdelt_state_path = Path(db_path).parent / ".gdelt_last_run"
         if _youtube_due(gdelt_state_path, gdelt_interval_minutes):
-            run("gdelt", lambda: gdelt.fetch(gdelt_cfg.get("query", "")))
+            # GDELT 查询词默认由 topics 拼成；配置里写了 query 时以配置为准。
+            gdelt_query = gdelt_cfg.get("query") or topics_mod.gdelt_query(topics)
+            run("gdelt", lambda: gdelt.fetch(gdelt_query))
             _mark_youtube_run(gdelt_state_path)
         else:
             counts["gdelt"] = 0
@@ -261,6 +318,26 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
         run("x", lambda: x_api.fetch(sources["x"].get("queries", [])))
     if sources.get("tiktok", {}).get("enabled", False):
         run("tiktok", lambda: tiktok.fetch(sources["tiktok"].get("queries", [])))
+
+    # 免费新闻 API（NewsAPI / Guardian / NYT / NewsData）：查询词全部来自
+    # topics；每个来源单独限频（state 文件），间隔按免费额度算出，
+    # 见 docs/NEWS_APIS.md。无 key 时 adapter 直接返回 []、不发请求；
+    # 只有配了 key 才记时间，这样新填 key 后下一轮立即就能跑，不用等满间隔。
+    for api_name, api_module, env_key in _NEWS_APIS:
+        api_cfg = sources.get(api_name, {})
+        if not api_cfg.get("enabled", False):
+            continue
+        api_interval = int(
+            api_cfg.get("interval_minutes", _NEWS_API_DEFAULT_INTERVALS[api_name])
+        )
+        api_state_path = Path(db_path).parent / f".{api_name}_last_run"
+        if _youtube_due(api_state_path, api_interval):
+            run(api_name, lambda m=api_module: m.fetch(topics))
+            if os.environ.get(env_key):
+                _mark_youtube_run(api_state_path)
+        else:
+            counts[api_name] = 0
+            logger.info("%s 本轮跳过：未满 %d 分钟间隔", api_name, api_interval)
 
     # 跨平台计数：同一标题出现在几个平台
     title_platforms: dict[str, set] = defaultdict(set)
