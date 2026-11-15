@@ -20,7 +20,14 @@ sources:
       - "https://feeds.bbci.co.uk/news/world/rss.xml"
       - "https://feeds.bbci.co.uk/news/technology/rss.xml"
   gdelt:
-    enabled: true
+    # 2026-11-15 已停用：Doc API 持续限流——当天本机 3 次失败（429×2 +
+    # 限流提示文本×1），云服务器 IP 多次 429，用户手机上试最小窄查询
+    #（technology、英文、1 天、10 条）同样返回限流提示。IP 和查询范围
+    # 都已排除，是 GDELT 服务端过载主动丢请求（见 docs/GDELT 研究）。
+    # 停用后每轮不再浪费重试时间；GDELT 本来就没有互动量数据，停用
+    # 对增长计算没有损失。以后想再试：把下面改回 true 即可；先在
+    # 浏览器打开窄查询地址确认返回 JSON 再开。
+    enabled: false
     query: "technology OR breaking news"
     max_records: 50
     # GDELT 单独放宽到每 60 分钟 1 次（不是每 15 分钟）：2026-11-15 连续 3 次
