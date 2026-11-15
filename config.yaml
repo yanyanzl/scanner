@@ -16,9 +16,26 @@ weights:
 sources:
   rss:
     enabled: true
+    # 免费 RSS 源（2026-11-15 实测可用，均无需 key；失败的源会被跳过
+    # 并记一条 warning，不影响本轮）。Google News 背后是几百家媒体，
+    # 它的链接是 news.google.com 的跳转地址，同一事件在不同查询里
+    # 可能出现两次，聚类会把它们并成一个事件。
+    # 未加入的：路透社 rssFeed 返回 401（可能挡云服务器 IP，用户 Mac
+    # 上浏览器能打开的话可以再加）、美联社 apnews.com/rss 连接失败。
     feeds:
       - "https://feeds.bbci.co.uk/news/world/rss.xml"
       - "https://feeds.bbci.co.uk/news/technology/rss.xml"
+      # Google News（聚合源）：突发与科技各一
+      - "https://news.google.com/rss/search?q=breaking%20news&hl=en-GB&gl=GB&ceid=GB:en"
+      - "https://news.google.com/rss/search?q=technology&hl=en-GB&gl=GB&ceid=GB:en"
+      # Bing News（聚合源）：突发
+      - "https://www.bing.com/news/search?q=breaking+news&format=rss"
+      # 综合新闻
+      - "https://www.aljazeera.com/xml/rss/all.xml"
+      # 科技
+      - "https://news.ycombinator.com/rss"
+      - "https://techcrunch.com/feed/"
+      - "https://www.theverge.com/rss/index.xml"
   gdelt:
     # 2026-11-15 已停用：Doc API 持续限流——当天本机 3 次失败（429×2 +
     # 限流提示文本×1），云服务器 IP 多次 429，用户手机上试最小窄查询
