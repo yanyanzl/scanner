@@ -33,6 +33,11 @@ sources:
     queries:
       - "breaking news"
       - "technology"
+    # YouTube 单独放宽到每 30 分钟 1 次（不是每 15 分钟）：2 个查询词 × 48 次/天 = 96 次搜索/天，
+    # 搜索桶上限是 100 次/天（Google 官方配额，2026-06-01 起 search.list 单独成桶、每次 1 单位），留 4 次缓冲。
+    # videos.list 每次 1 单位，共用池 10,000 units/天，96 次只占 96 units。配额每天太平洋时间午夜重置。
+    # 原配置 2 词 × 96 次/天 = 192 次搜索/天，接通当天就可能超限。见 trend_radar/collector.py。
+    interval_minutes: 30
   x:
     enabled: false  # 配置 X_BEARER_TOKEN 后改为 true（按付费服务处理）
     queries:

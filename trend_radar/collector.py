@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -43,6 +44,33 @@ def load_config(config_path: Path | None = None) -> dict:
         return yaml.safe_load(f) or {}
 
 
+def _youtube_state_path(db_path: Path) -> Path:
+    """YouTube 上次采集时间戳文件（与数据库放同一目录，见 .gitignore）。"""
+    return Path(db_path).parent / ".youtube_last_run"
+
+
+def _youtube_due(state_path: Path, interval_minutes: int, now: datetime | None = None) -> bool:
+    """距上次 YouTube 采集是否已满间隔。没有记录文件（首次运行）时返回 True。"""
+    now = now or datetime.now(timezone.utc)
+    try:
+        last = datetime.fromisoformat(
+            Path(state_path).read_text(encoding="utf-8").strip().replace("Z", "+00:00")
+        )
+    except (OSError, ValueError):
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (now - last).total_seconds() >= int(interval_minutes) * 60
+
+
+def _mark_youtube_run(state_path: Path, now: datetime | None = None) -> None:
+    """记下本次 YouTube 采集时间。"""
+    now = now or datetime.now(timezone.utc)
+    path = Path(state_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(now.isoformat(), encoding="utf-8")
+
+
 def collect_once(config: dict | None = None, config_path: Path | None = None) -> dict:
     """跑一轮采集，返回各平台采集数量。未配置凭证的平台返回 0 条并记录未启用。"""
     load_env()
@@ -50,6 +78,11 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
     sources = cfg.get("sources", {})
     interval_minutes = int(cfg.get("scan_interval_minutes", 15))
     interval_hours = max(interval_minutes / 60.0, 0.01)
+    # YouTube 单独间隔（默认 30 分钟，见 config.yaml）：搜索桶上限 100 次/天，
+    # 每 15 分钟搜 2 个词一天就是 192 次，接通当天即超限。
+    youtube_cfg = sources.get("youtube", {})
+    youtube_interval_minutes = int(youtube_cfg.get("interval_minutes", 60))
+    youtube_interval_hours = max(youtube_interval_minutes / 60.0, 0.01)
     db_path = BASE_DIR / cfg.get("db_path", "data/trends.sqlite3")
 
     all_items: list[dict] = []
@@ -70,8 +103,16 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
         run("gdelt", lambda: gdelt.fetch(sources["gdelt"].get("query", "")))
     if sources.get("reddit", {}).get("enabled", False):
         run("reddit", lambda: reddit.fetch(sources["reddit"].get("subreddits", [])))
-    if sources.get("youtube", {}).get("enabled", False):
-        run("youtube", lambda: youtube.fetch(sources["youtube"].get("queries", [])))
+    if youtube_cfg.get("enabled", False):
+        state_path = _youtube_state_path(db_path)
+        if _youtube_due(state_path, youtube_interval_minutes):
+            run("youtube", lambda: youtube.fetch(youtube_cfg.get("queries", [])))
+            # 只有配了 Key 才记时间：没 Key 时不消耗配额，填好 Key 后下一轮立即就能跑，不用等满 30 分钟。
+            if os.environ.get("YOUTUBE_API_KEY"):
+                _mark_youtube_run(state_path)
+        else:
+            counts["youtube"] = 0
+            logger.info("YouTube 本轮跳过：未满 %d 分钟间隔", youtube_interval_minutes)
     if sources.get("x", {}).get("enabled", False):
         run("x", lambda: x_api.fetch(sources["x"].get("queries", [])))
     if sources.get("tiktok", {}).get("enabled", False):
@@ -102,10 +143,15 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
             if row:
                 previous = dbmod.previous_engagement(conn, int(row["id"]))
             cross = len(title_platforms.get(item.get("title", "").strip().lower(), set()))
+            # YouTube 快照是每 30 分钟一次，用 0.5 小时算增长才对；若仍用全局 0.25 小时，
+            # 增长速度会被高估 2 倍。其他平台沿用全局扫描间隔。
+            item_hours = (
+                youtube_interval_hours if item.get("platform") == "youtube" else interval_hours
+            )
             result = score_item(
                 item,
                 previous_engagement=previous,
-                interval_hours=interval_hours,
+                interval_hours=item_hours,
                 cross_platform_count=max(1, cross),
             )
             item_id = dbmod.upsert_item(conn, item, result)
