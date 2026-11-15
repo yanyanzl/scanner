@@ -12,7 +12,7 @@ import yaml
 
 from trend_radar import db as dbmod
 from trend_radar.adapters import gdelt, reddit, rss, tiktok, x_api, youtube
-from trend_radar.scoring import score_item
+from trend_radar.scoring import parse_dt, score_item
 
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -141,9 +141,12 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
             ).fetchone()
             previous = None
             previous_growth = 0.0
+            prev_collected_at = None
             if row:
                 # 有上一轮快照：按真实增量算；同时读出上轮增速，供算加速度。
-                previous = dbmod.previous_snapshot(conn, int(row["id"]))
+                snap = dbmod.previous_snapshot(conn, int(row["id"]))
+                if snap is not None:
+                    previous, prev_collected_at = snap
                 previous_growth = float(row["growth"] or 0)
             if previous is None:
                 # 首次见到（没有任何快照）：本轮只作基线——增速记 0，
@@ -154,11 +157,23 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
                 previous = float(item.get("engagement") or 0)
                 previous_growth = 0.0
             cross = len(title_platforms.get(item.get("title", "").strip().lower(), set()))
-            # YouTube 快照是每 30 分钟一次，用 0.5 小时算增长才对；若仍用全局 0.25 小时，
-            # 增长速度会被高估 2 倍。其他平台沿用全局扫描间隔。
-            item_hours = (
+            # 名义间隔：YouTube 快照是每 30 分钟一次，用 0.5 小时；
+            # 其他平台沿用全局扫描间隔（默认 0.25 小时）。
+            nominal_hours = (
                 youtube_interval_hours if item.get("platform") == "youtube" else interval_hours
             )
+            # 增速除以两次快照之间的真实间隔，而不是名义间隔：
+            # 定时器每 15 分钟一跳，YouTube 实际间隔会被量化成 30–45 分钟，
+            # 电脑休眠/重启后间隔更长；一直除以 0.5 小时会把增速高估
+            # （实测：40 分钟间隔、增量 469.2 被算成 938.4/小时，
+            # 真实约 704/小时）。间隔短于名义值时（手动连跑两轮）
+            # 仍按名义值算，避免除以几秒钟把增速吹上天。
+            item_hours = nominal_hours
+            if prev_collected_at:
+                prev_dt = parse_dt(prev_collected_at)
+                if prev_dt is not None:
+                    elapsed = (datetime.now(timezone.utc) - prev_dt).total_seconds() / 3600
+                    item_hours = max(nominal_hours, elapsed)
             result = score_item(
                 item,
                 previous_engagement=previous,
