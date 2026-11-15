@@ -228,9 +228,18 @@ def _collect_priority_texts(
     for ev in top_events or []:
         add(ev.get("name", ""), event_id=ev.get("event_id", ""))
     for burst in bursts or []:
-        ev = events_by_id.get(burst.get("event_id", ""))
-        if ev:
-            add(ev.get("name", ""), event_id=ev.get("event_id", ""))
+        # 爆发事件可能不在本轮聚类输出里：detect_bursts 从库里读所有事件，
+        # 有快照的事件都会被判爆发（比如只有 1 条快照的老事件），而
+        # cluster_from_db 只聚最近窗口内的内容——窗口外的事件不在 events
+        # 里。它的事件名一样要翻：用 burst 自带的名字（来自库里 events.name），
+        # 不能因为 events_by_id 里没有它就跳过。跳过的话，它的提醒永远显示
+        # 原标题，还会和已翻成中文的同名事件拆成两条提醒（2026-11-15 实测：
+        # 6 个同名直播事件拆成中文/原文两条）。
+        event_id = burst.get("event_id", "")
+        ev = events_by_id.get(event_id)
+        name = (ev.get("name", "") if ev else "") or burst.get("name", "")
+        if name:
+            add(name, event_id=event_id)
     target_ids: list[str] = []
     for ev in top_events or []:
         target_ids.append(ev.get("event_id", ""))
@@ -328,11 +337,19 @@ def _translate_priority_texts(
         """把一批译文写回库 + 内存里的 bursts；返回实际写进的条数。"""
         applied = 0
         translated_names: dict[str, str] = {}
+        # 归一化原名 -> 译文：同名事件的译文按文本归属——只要 burst 的
+        # 原名就是某条已翻文本（归一化后相同），不管它的 event_id 有没有
+        # 进本轮的翻译目标集，都用同一条中文名（见 _collect_priority_texts
+        # 里 burst 循环的注释；2026-11-15 实测：6 个同名直播事件里有几个
+        # 不在本轮聚类输出里，翻译只写回了在集里的，提醒按显示名去重时
+        # 拆成了中文/原文两条）。
+        translated_by_name: dict[str, str] = {}
         for text, translated in results.items():
             entry = entry_by_text.get(text)
             if entry is None or not translated or translated == text:
                 continue
             applied += 1
+            translated_by_name[" ".join(text.lower().split())] = translated
             for event_id in entry["events"]:
                 dbmod.set_event_name_zh(conn, event_id, translated)
                 translated_names[event_id] = translated
@@ -345,8 +362,21 @@ def _translate_priority_texts(
         conn.commit()
         for burst in bursts or []:
             name_zh = translated_names.get(burst.get("event_id", ""))
+            if not name_zh:
+                raw = " ".join(str(burst.get("name") or "").lower().split())
+                if raw:
+                    name_zh = translated_by_name.get(raw)
             if name_zh:
                 burst["name_zh"] = name_zh
+                # 同名事件没进翻译目标集时库里的 name_zh 还是空的：顺手
+                # 补写，下轮 detect_bursts 直接读到中文名；已有中文名的不动。
+                event_id = burst.get("event_id", "")
+                if event_id and event_id not in translated_names:
+                    row = conn.execute(
+                        "SELECT name_zh FROM events WHERE event_id = ?", (event_id,)
+                    ).fetchone()
+                    if row is not None and not (row["name_zh"] or "").strip():
+                        dbmod.set_event_name_zh(conn, event_id, name_zh)
         return applied
 
     azure_usage_path = Path(db_path).parent / translate_mod.AZURE_USAGE_FILENAME
@@ -624,6 +654,22 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
             events = cluster_from_db(db_path)
             persist_events(conn, events)
             bursts = detect_bursts(conn, thresholds=cfg.get("burst"))
+            # 重复出现：同名事件在窗口内已跨平台出现过（burst 的
+            # is_recurrence，见 trend_radar/burst.py）——不发提醒。
+            # 排名和翻译仍用完整 bursts 列表：rank_events 会按
+            # is_recurrence 去掉爆发加分和新鲜度分；翻译按文本去重，
+            # 已翻过的名字不再调接口。
+            recurrence_bursts = [b for b in bursts if b.get("is_recurrence")]
+            alert_bursts = [b for b in bursts if not b.get("is_recurrence")]
+            counts["bursts_recurrence"] = len(recurrence_bursts)
+            if recurrence_bursts:
+                window_h = (cfg.get("burst") or {}).get("recurrence_window_hours", 24)
+                logger.info(
+                    "重复出现 %d 个（同名事件 %s 小时内已跨平台），不发提醒: %s",
+                    len(recurrence_bursts),
+                    window_h,
+                    "; ".join(b["name"] for b in recurrence_bursts),
+                )
             # 优先翻译：必须在排名与爆发检测之后、发提醒之前——
             # 只翻 Top 5 事件名 + 爆发事件名 + 各事件最高分成员标题
             # （见 docs/TRANSLATION.md）。Azure 每轮都跑（月度用量
@@ -676,8 +722,8 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
                 try:
                     from trend_radar.alerts import send_burst_alerts
 
-                    if cfg.get("telegram", {}).get("enabled", True):
-                        alert_result = send_burst_alerts(bursts)
+                    if cfg.get("telegram", {}).get("enabled", True) and alert_bursts:
+                        alert_result = send_burst_alerts(alert_bursts)
                         counts["alerts_sent"] = alert_result["sent"]
                         counts["alerts_failed"] = len(alert_result["errors"])
                         if alert_result["errors"]:
@@ -692,11 +738,12 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
                 except Exception as exc:  # 提醒失败不影响采集结果
                     logger.warning("Telegram 提醒异常（不影响采集）: %s", exc)
                     counts["alerts_sent"] = 0
-                    counts["alerts_failed"] = len(bursts)
+                    counts["alerts_failed"] = len(alert_bursts)
         except Exception as exc:  # 聚类/持久化失败不影响采集结果
             logger.warning("事件聚类/持久化失败（不影响采集）: %s", exc)
             counts["events"] = 0
             counts["bursts"] = 0
+            counts["bursts_recurrence"] = 0
     finally:
         conn.close()
 

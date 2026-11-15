@@ -16,6 +16,10 @@
     这样条数很多的大事件有加分，但不会靠堆条数垄断榜单。
   爆发：事件出现在本轮 burst 列表里为 1，否则为 0（固定加分，不
     是归一化——爆发本身就是加速度信号，见 docs/P2_PREP.md）。
+    例外：burst 里 is_recurrence 为真的是重复出现（同名事件在
+    窗口内已跨平台出现过，见 trend_radar/burst.py::is_recurrence），
+    不算新故事——爆发分量记 0，新鲜度分量也记 0，原因里也不写
+    “首次出现”。增长、成员强度、跨平台分量是真实的，照常算。
   跨平台：platform_count，在本批事件里 min-max 归一化。同一件事
     在多个平台出现，说明它在扩散。
   新鲜度：半衰期衰减 0.5 ** (age_hours / half_life)，默认半衰期 24
@@ -153,11 +157,13 @@ def _rank_reasons(
     burst_reasons: list[str],
     age_hours: float | None,
     is_fastest_growth: bool,
+    is_recurrence: bool = False,
 ) -> list[str]:
     """给一个事件生成展示用的原因（中文短语，只写有信息量的）。
 
     顺序：爆发原因 → 平台数 → 增长最快 → 新鲜度；什么都没命中时
-    兜底写最高分，保证原因列表永远非空。
+    兜底写最高分，保证原因列表永远非空。重复出现的事件不写爆发
+    原因、也不写“首次出现”（它不是新故事）。
     """
     reasons: list[str] = []
     for reason in burst_reasons:
@@ -169,7 +175,7 @@ def _rank_reasons(
         reasons.append(f"{platform_count} 个平台")
     if is_fastest_growth:
         reasons.append("增长最快")
-    if age_hours is not None and age_hours < FRESHNESS_REASON_MAX_HOURS:
+    if not is_recurrence and age_hours is not None and age_hours < FRESHNESS_REASON_MAX_HOURS:
         if age_hours < 1:
             reasons.append("1 小时内首次出现")
         else:
@@ -206,10 +212,13 @@ def rank_events(
     half_life = _resolve_half_life(freshness_half_life_hours, weights)
 
     burst_by_id: dict[str, list[str]] = {}
+    recurrence_ids: set[str] = set()
     for burst in bursts or []:
         event_id = burst.get("event_id")
         if event_id:
             burst_by_id[event_id] = list(burst.get("reasons") or [])
+            if burst.get("is_recurrence"):
+                recurrence_ids.add(event_id)
 
     growth_raw = [max(0.0, float(ev.get("max_growth") or 0)) for ev in events]
     member_raw = [
@@ -228,10 +237,13 @@ def rank_events(
     ranked: list[dict] = []
     for idx, ev in enumerate(events):
         event_id = ev.get("event_id") or ""
-        burst_reasons = burst_by_id.get(event_id, [])
+        is_recurrence = event_id in recurrence_ids
+        # 重复出现：爆发分量和新鲜度分量都记 0（不是新故事），
+        # 增长、成员强度、跨平台分量照常算。
+        burst_reasons = [] if is_recurrence else burst_by_id.get(event_id, [])
         age_hours = ages[idx]
-        if age_hours is None:
-            novelty = 0.0  # first_seen 缺失：按“很老”算，不 crash。
+        if is_recurrence or age_hours is None:
+            novelty = 0.0  # 重复出现：没有“新”的新鲜度分；first_seen 缺失：按“很老”算，不 crash。
         else:
             novelty = 0.5 ** (age_hours / half_life)
         score = (
@@ -248,6 +260,7 @@ def rank_events(
             burst_reasons,
             age_hours,
             is_fastest_growth=(growth_raw[idx] > 0 and growth_raw[idx] >= max_growth),
+            is_recurrence=is_recurrence,
         )
         ranked.append(out)
     ranked.sort(key=lambda e: (-e["rank_score"], e.get("event_id") or ""))

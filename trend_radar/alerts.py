@@ -78,6 +78,18 @@ def _normalize_name(burst: dict) -> str:
     return " ".join(str(name).lower().split())
 
 
+def _normalize_raw_name(burst: dict) -> str:
+    """归一化后的原始事件名（不带翻译状态），去重时与显示名一起用。
+
+    同名事件可能因为翻译状态不同而显示名不同（有的已翻成中文、有的
+    还是原文）——只按显示名去重会把它们拆成两条提醒（2026-11-15 实测：
+    6 个同名直播事件拆成中文/原文两条）。原名相同就是同一条提醒，
+    不管中文名有还是没有、是不是同一个译文。
+    """
+    name = burst.get("name") or ""
+    return " ".join(str(name).lower().split())
+
+
 def send_burst_alerts(
     bursts: list[dict] | None,
     bot_token: str | None = None,
@@ -92,7 +104,11 @@ def send_burst_alerts(
 
     去重：同一轮里归一化后名字相同的爆发只发第一条（2026-11-15 实测：
     同一个马拉雅拉姆语小时直播标题在一轮里分成了 3 个事件、发了 3 条
-    一模一样的提醒）。只去重，不改爆发检测规则、不改事件 ID 生成。
+    一模一样的提醒）。去重键是显示名（中文名优先）**或**原始名——
+    原名相同就算显示名不同也只发一条，这样同名事件不会因为翻译状态
+    不同（有的已翻成中文、有的还是原文）而拆成两条提醒（2026-11-15
+    20:36 实测：6 个同名直播事件拆成中文/原文两条）。只去重，不改
+    爆发检测规则、不改事件 ID 生成。
 
     一条失败不影响其他条：失败记进 errors 并记 warning，函数本身
     不抛异常。返回 {"sent": n, "skipped": m, "errors": [...]}，
@@ -102,12 +118,16 @@ def send_burst_alerts(
     bursts = list(bursts or [])
     total = len(bursts)
     seen_names: set[str] = set()
+    seen_raw_names: set[str] = set()
     unique_bursts: list[dict] = []
     for burst in bursts:
-        key = _normalize_name(burst)
-        if key in seen_names:
+        display_key = _normalize_name(burst)
+        raw_key = _normalize_raw_name(burst)
+        if display_key in seen_names or (raw_key and raw_key in seen_raw_names):
             continue
-        seen_names.add(key)
+        seen_names.add(display_key)
+        if raw_key:
+            seen_raw_names.add(raw_key)
         unique_bursts.append(burst)
     if len(unique_bursts) != total:
         logger.info(

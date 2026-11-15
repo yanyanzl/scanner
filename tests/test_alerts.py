@@ -246,6 +246,38 @@ class TestSendBurstAlertsDedup(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         self.assertEqual(result["sent"], 1)
 
+    def test_same_raw_name_split_by_translation_state_one_alert(self):
+        """回归（2026-11-15 20:36 实测）：同名事件因为翻译状态不同拆成两条。
+
+        6 个同名直播事件里，有的 burst 已有 name_zh（中文名），有的还是
+        空——只按显示名（中文名优先）去重会把它们当成两个事件。去重键必须
+        与翻译状态无关：原名相同就是同一条提醒。
+        """
+        name = "Today Breaking News LIVE | Top Headlines Of The Hour | 15.11.2026"
+        b1 = _burst("evt_1", name=name)
+        b1["name_zh"] = "今日突发新闻直播 | 本时头条新闻 | 本小时头条 | 15.11.2026"
+        b2 = _burst("evt_2", name=name)
+        b2["name_zh"] = None
+        b3 = _burst("evt_3", name=name)
+        b3["name_zh"] = None
+        result, post = self._send([b1, b2, b3])
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(result["skipped"], 2)
+        # 留下的是第一条（中文名那条）。
+        self.assertIn("evt_1", post.call_args.kwargs["json"]["text"])
+
+    def test_same_raw_name_different_translations_one_alert(self):
+        # 原名相同、中文名不同（两次翻译结果不一致）：仍是同一条提醒。
+        name = "Today Breaking News LIVE | Top Headlines Of The Hour | 15.11.2026"
+        b1 = _burst("evt_1", name=name)
+        b1["name_zh"] = "今日突发新闻直播"
+        b2 = _burst("evt_2", name=name)
+        b2["name_zh"] = "今日突发新闻实况"
+        result, post = self._send([b1, b2])
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(result["sent"], 1)
+
     def test_dedup_keeps_first_occurrence_order(self):
         bursts = [
             _burst("evt_1", name="Shared Name"),

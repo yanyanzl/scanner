@@ -61,6 +61,54 @@ class TestRankEvents(unittest.TestCase):
         self.assertEqual(ranked[0]["event_id"], "evt_b")
         self.assertIn("增速突增", ranked[0]["rank_reasons"])
 
+    def test_recurrence_loses_burst_boost_and_novelty(self):
+        """重复出现：爆发分量和新鲜度分量都记 0，分差恰好是两项权重之和。
+
+        两个完全相同的事件（刚出现，新鲜度 1.0），一个是正常爆发，
+        一个是重复出现：正常 65.0 分（0.30×0.5 + 0.20×0.5 + 0.20×1
+        + 0.20×0.5 + 0.10×1.0），重复出现 35.0 分，分差正好 30.0
+        = (0.20 爆发 + 0.10 新鲜度) × 100。原因里也不写“首次出现”。
+        """
+        a = _ev("evt_a", first_seen_hours_ago=0.0)
+        b = _ev("evt_b", first_seen_hours_ago=0.0)
+        bursts = [
+            {"event_id": "evt_a", "reasons": ["new_multi_platform"]},
+            {
+                "event_id": "evt_b",
+                "reasons": ["new_multi_platform"],
+                "is_recurrence": True,
+            },
+        ]
+        ranked = rank_events([a, b], bursts=bursts, now=NOW)
+        by_id = {e["event_id"]: e for e in ranked}
+        self.assertEqual(by_id["evt_a"]["rank_score"], 65.0)
+        self.assertEqual(by_id["evt_b"]["rank_score"], 35.0)
+        self.assertEqual(
+            by_id["evt_a"]["rank_score"] - by_id["evt_b"]["rank_score"], 30.0
+        )
+        self.assertIn("新事件首次跨平台", by_id["evt_a"]["rank_reasons"])
+        self.assertIn("1 小时内首次出现", by_id["evt_a"]["rank_reasons"])
+        self.assertNotIn("新事件首次跨平台", by_id["evt_b"]["rank_reasons"])
+        self.assertTrue(
+            all("首次出现" not in r for r in by_id["evt_b"]["rank_reasons"])
+        )
+
+    def test_recurrence_keeps_growth_member_and_platform(self):
+        """重复出现只扣爆发和新鲜度：增长、成员强度、跨平台分量照常算——
+        一个高增长的重复出现事件仍能胜过低增长的普通事件。"""
+        rec = _ev(
+            "evt_rec", first_seen_hours_ago=0.0, max_growth=1000.0,
+            max_score=0.9, total_score=9.0, platform_count=3,
+            platforms=["rss", "youtube", "gdelt"],
+        )
+        plain = _ev("evt_plain", first_seen_hours_ago=0.0)
+        bursts = [
+            {"event_id": "evt_rec", "reasons": ["new_multi_platform"],
+             "is_recurrence": True}
+        ]
+        ranked = rank_events([plain, rec], bursts=bursts, now=NOW)
+        self.assertEqual(ranked[0]["event_id"], "evt_rec")
+
     def test_fresh_beats_old(self):
         """其他条件完全相同，1 小时前出现的事件胜过 2 天前的。"""
         fresh = _ev("evt_fresh", first_seen_hours_ago=1.0)

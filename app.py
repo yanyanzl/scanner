@@ -54,9 +54,15 @@ else:
                 "平台": ", ".join(ev.get("platforms", [])),
                 "最大增长/小时": ev.get("max_growth", 0),
                 "原因": " · ".join(ev.get("rank_reasons") or []),
+                "链接": ev.get("link_url") or None,
             }
             for i, ev in enumerate(top_events)
         ],
+        column_config={
+            # “查看”是可点链接（LinkColumn）；没有 URL 的事件该格为空，
+            # 事件名仍是纯文本，不给死链接。
+            "链接": st.column_config.LinkColumn("链接", display_text="查看"),
+        },
         width="stretch",
     )
     st.caption(

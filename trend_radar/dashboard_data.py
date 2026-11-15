@@ -164,6 +164,68 @@ def _history_series(
     return times, series
 
 
+_LINK_URL_IN_CHUNK = 500
+
+
+def _earliest_collected_url(conn, urls) -> str:
+    """在 items 表里找给定 URL 中 collected_at 最早的一个；找不到返回 ""。
+
+    URL 分批查（SQLite 变量数上限），每批取最早的一条再跨批比较。
+    collected_at 是 ISO 时间文本，字符串比较即时间比较。
+    """
+    best_url = ""
+    best_time: str | None = None
+    url_list = sorted(urls)
+    for i in range(0, len(url_list), _LINK_URL_IN_CHUNK):
+        part = url_list[i : i + _LINK_URL_IN_CHUNK]
+        placeholders = ",".join("?" * len(part))
+        row = conn.execute(
+            f"SELECT url, collected_at FROM items WHERE url IN ({placeholders}) "
+            "AND url != '' ORDER BY collected_at ASC LIMIT 1",
+            part,
+        ).fetchone()
+        if row and row[0]:
+            t = str(row[1] or "")
+            if best_time is None or t < best_time:
+                best_time = t
+                best_url = str(row[0])
+    return best_url
+
+
+def _event_link_url(conn, ev: dict) -> str:
+    """事件的代表链接：分数最高成员的 URL；该成员没有 URL 时，取事件里
+    最早采集到的成员 URL；都没有时返回 ""（调用方显示纯文本，不给死链接）。
+
+    members 在 cluster_items 里已按分数降序排好；最早采集需要查
+    items 表的 collected_at（成员 dict 里没有这个字段），所以回退
+    需要一个数据库连接；conn 为 None 时退回按分数顺序取第一个有
+    URL 的成员。任何一步失败都返回 ""，不抛异常。
+    """
+    try:
+        members = ev.get("items") or []
+        if members:
+            top = max(members, key=lambda it: float(it.get("score") or 0))
+            url = (top.get("url") or "").strip()
+            if url:
+                return url
+        urls = {(it.get("url") or "").strip() for it in members}
+        urls.discard("")
+        if conn is not None and urls:
+            try:
+                best = _earliest_collected_url(conn, urls)
+                if best:
+                    return best
+            except sqlite3.Error:
+                pass
+        for it in members:
+            url = (it.get("url") or "").strip()
+            if url:
+                return url
+    except Exception:
+        pass
+    return ""
+
+
 def load_top_events(db_path: str | Path, limit: int | None = None) -> list[dict]:
     """取综合排名最靠前的事件（Top N，见 trend_radar/event_ranking.py）。
 
@@ -198,6 +260,15 @@ def load_top_events(db_path: str | Path, limit: int | None = None) -> list[dict]
             if name_zh and name_zh != ev.get("name"):
                 ev["name_original"] = ev.get("name", "")
                 ev["name"] = name_zh
+        # 代表链接：分数最高成员的 URL（没有时取最早采集的成员 URL，
+        # 都没有时为 ""）。链接计算失败不影响排名，只记空链接。
+        conn = _connect(db_path)
+        try:
+            for ev in ranked:
+                ev["link_url"] = _event_link_url(conn, ev)
+        finally:
+            if conn is not None:
+                conn.close()
         return ranked[: max(1, top_n)]
     except Exception as exc:  # 排名失败不影响 Dashboard 其余各节
         logger.warning("加载最热事件失败：%s", exc)

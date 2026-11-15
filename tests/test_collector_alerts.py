@@ -35,6 +35,7 @@ _BURST = {
     "event_id": "evt_test123",
     "name": "Test Event",
     "reasons": ["new_multi_platform"],
+    "is_recurrence": False,
     "current": {
         "item_count": 2,
         "platform_count": 2,
@@ -47,9 +48,16 @@ _BURST = {
     "detected_at": "2026-11-15T13:00:00+00:00",
 }
 
+_RECURRENCE_BURST = dict(
+    _BURST,
+    event_id="evt_recur1",
+    name="Recurring Live Stream",
+    is_recurrence=True,
+)
+
 
 class TestCollectorAlerts(unittest.TestCase):
-    def _run(self, telegram_enabled=True, alert_side_effect=None):
+    def _run(self, telegram_enabled=True, alert_side_effect=None, bursts=None):
         import tempfile
 
         item = {
@@ -77,7 +85,8 @@ class TestCollectorAlerts(unittest.TestCase):
                     "trend_radar.clustering.persist_events", mock.Mock(return_value=None)
                 ),
                 mock.patch(
-                    "trend_radar.burst.detect_bursts", mock.Mock(return_value=[_BURST])
+                    "trend_radar.burst.detect_bursts",
+                    mock.Mock(return_value=list(bursts) if bursts is not None else [_BURST]),
                 ),
                 mock.patch("trend_radar.alerts.send_burst_alerts", send),
             ):
@@ -103,6 +112,25 @@ class TestCollectorAlerts(unittest.TestCase):
         self.assertEqual(counts["alerts_sent"], 0)
         self.assertEqual(counts["alerts_failed"], 1)
         self.assertEqual(counts["saved"], 1)
+
+    def test_recurrence_burst_no_alert_and_counted(self):
+        """重复出现的爆发：不发提醒，但 bursts_recurrence 单独计数。"""
+        counts, send = self._run(bursts=[_RECURRENCE_BURST])
+        send.assert_not_called()
+        self.assertEqual(counts["bursts"], 1)
+        self.assertEqual(counts["bursts_recurrence"], 1)
+        self.assertEqual(counts["alerts_sent"], 0)
+        self.assertEqual(counts["alerts_failed"], 0)
+
+    def test_mixed_bursts_only_normal_alerts(self):
+        """正常爆发 + 重复出现：只给正常那条发提醒，重复出现那条只计数。"""
+        counts, send = self._run(bursts=[_BURST, _RECURRENCE_BURST])
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], [_BURST])
+        self.assertEqual(counts["bursts"], 2)
+        self.assertEqual(counts["bursts_recurrence"], 1)
+        self.assertEqual(counts["alerts_sent"], 1)
+        self.assertEqual(counts["alerts_failed"], 0)
 
 
 if __name__ == "__main__":

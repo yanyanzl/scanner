@@ -849,6 +849,145 @@ class TestAzureWiring(unittest.TestCase):
                 _read_usage(d), {"month": _current_month(), "chars": 299}
             )
 
+    def test_same_name_bursts_split_by_translation_state_one_alert(self):
+        """回归（2026-11-15 20:36 实测）：6 个同名直播事件拆成中文/原文两条提醒。
+
+        场景：3 个爆发事件共享同一个事件名，其中 1 个在本轮聚类输出里
+        （Top 5），另外 2 个不在——它们是早一轮建的事件，快照只有 1 条，
+        仍被 detect_bursts 判为 new_multi_platform，但本轮 cluster_from_db
+        的窗口里已经没有它们的成员内容。修复前：翻译只写回了在聚类输出里
+        的那个事件，另外 2 个 burst 的 name_zh 还是空，提醒去重按显示名
+        （中文名优先）把它们当成两个事件，发了 2 条。修复后：3 个 burst
+        都有同一个中文名，只发 1 条提醒。
+        """
+        title = (
+            "Today Breaking News LIVE | ഈ മണിക്കൂറിലെ പ്രധാന വാർത്ത | "
+            "Top Headlines Of The Hour | 15.11.2026"
+        )
+        chinese = "今日突发新闻直播 | 本时头条新闻 | 本小时头条 | 15.11.2026"
+        event_a = {
+            "event_id": "evt_bc521d54d2246ae6",
+            "name": title,
+            "member_count": 1,
+            "platform_count": 2,
+            "platforms": ["rss", "youtube"],
+            "max_score": 34.2226,
+            "total_score": 34.2226,
+            "max_growth": 938.4,
+            "first_seen": "2026-11-15T20:00:00+00:00",
+            "member_urls": ["https://example.com/live-a"],
+            "member_titles": [title],
+            "member_scores": [34.2226],
+            "items": [{"title": title, "score": 34.2226}],
+        }
+
+        def _burst(event_id, total_score, item_count):
+            return {
+                "event_id": event_id,
+                "name": title,
+                "name_zh": None,
+                "reasons": ["new_multi_platform"],
+                "current": {
+                    "platforms": "rss,youtube",
+                    "platform_count": 2,
+                    "max_growth": 938.4,
+                    "total_score": total_score,
+                    "item_count": item_count,
+                },
+                "previous": None,
+            }
+
+        bursts = [
+            _burst("evt_bc521d54d2246ae6", 34.2226, 110),
+            _burst("evt_f918e4374fdb012d", 32.0465, 103),
+            _burst("evt_aaaa1111bbbb2222", 30.0, 90),
+        ]
+        sent_texts = []
+
+        def _tg_post(url, kwargs):
+            sent_texts.append(kwargs["json"]["text"])
+            return _FakeResp(status_code=200, json_data={"ok": True, "result": {}})
+
+        def _azure_mapped(url, kw):
+            texts = [b["Text"] for b in kw["json"]]
+            return _FakeResp(
+                status_code=200,
+                json_data=[
+                    {"translations": [{"text": chinese if t == title else f"ZH:{t}", "to": "zh-Hans"}]}
+                    for t in texts
+                ],
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "trends.sqlite3"
+            # 3 个事件行都在库里（B、C 是早一轮建的，name_zh 为空），
+            # 但本轮聚类输出里只有 A。
+            conn = dbmod.connect(db_path)
+            for event_id, total_score, item_count in (
+                ("evt_bc521d54d2246ae6", 34.2226, 110),
+                ("evt_f918e4374fdb012d", 32.0465, 103),
+                ("evt_aaaa1111bbbb2222", 30.0, 90),
+            ):
+                conn.execute(
+                    "INSERT INTO events (event_id, name, name_zh, first_seen, "
+                    "last_seen, platform_count, item_count, total_score, "
+                    "max_score, max_growth) VALUES (?, ?, NULL, ?, ?, 2, ?, ?, ?, ?)",
+                    (
+                        event_id,
+                        title,
+                        "2026-11-15T20:00:00+00:00",
+                        "2026-11-15T20:36:00+00:00",
+                        item_count,
+                        total_score,
+                        total_score,
+                        938.4,
+                    ),
+                )
+            conn.commit()
+            conn.close()
+            post = _post_dispatcher(
+                azure_resp=_azure_mapped,
+                deepl_resp=_deepl_ok(),
+                telegram_resp=_tg_post,
+            )
+            env = _env_with()
+            env["TELEGRAM_BOT_TOKEN"] = "tg-token"
+            env["TELEGRAM_CHAT_ID"] = "123"
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch("trend_radar.collector.rss.fetch", mock.Mock(return_value=[])),
+                mock.patch("trend_radar.clustering.cluster_from_db", mock.Mock(return_value=[event_a])),
+                mock.patch("trend_radar.clustering.persist_events", mock.Mock(return_value=None)),
+                mock.patch("trend_radar.burst.detect_bursts", mock.Mock(return_value=bursts)),
+                mock.patch.object(translate_mod.requests, "post", post),
+            ):
+                counts = collect_once(config=_config(db_path))
+            # 只翻了 1 条文本（同名事件名去重后就是 1 条）。
+            self.assertEqual(counts["azure_translated"], 1)
+            # 3 个 burst 的 name_zh 必须全是同一个中文名——包括不在本轮
+            # 聚类输出里的 B、C。
+            for burst in bursts:
+                self.assertEqual(burst["name_zh"], chinese, burst["event_id"])
+            # 只发 1 条提醒，内容是中文名。
+            self.assertEqual(counts["alerts_sent"], 1)
+            self.assertEqual(len(sent_texts), 1)
+            self.assertIn(chinese, sent_texts[0])
+            self.assertIn("evt_bc521d54d2246ae6", sent_texts[0])
+            # 库里 3 个事件的 name_zh 也全写上了。
+            conn = dbmod.connect(db_path)
+            try:
+                for event_id in (
+                    "evt_bc521d54d2246ae6",
+                    "evt_f918e4374fdb012d",
+                    "evt_aaaa1111bbbb2222",
+                ):
+                    row = conn.execute(
+                        "SELECT name_zh FROM events WHERE event_id = ?", (event_id,)
+                    ).fetchone()
+                    self.assertEqual(row["name_zh"], chinese, event_id)
+            finally:
+                conn.close()
+
     def test_azure_failure_key_never_in_logs(self):
         """Azure 请求异常里夹带 key：轮次日志里也不出现 key。"""
         with tempfile.TemporaryDirectory() as d:

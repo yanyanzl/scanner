@@ -96,7 +96,37 @@ CLI：`python -m trend_radar.burst --db data/trends.sqlite3 [--json]`。
 | --- | --- | --- |
 | `growth_spike` | max_growth 翻倍以上，且绝对增量达标 | ×2.0，增量 ≥ 100/小时 |
 | `score_surge` | total_score 翻倍以上，且绝对增量达标 | ×2.0，增量 ≥ 5.0 |
-| `new_multi_platform` | 只有一条快照（首次出现），且已跨 ≥ N 个平台 | N = 2 |
+| `new_multi_platform` | 只有一条快照（首次出现），且已跨 ≥ N 个平台；且条数 ≥ 10 或总分 ≥ 5.0（最低质量门槛，见下） | N = 2 |
+
+**最低质量门槛（2026-11-15，只用于 `new_multi_platform`）：** 刚出现就
+跨平台本身是信号，但 7 条内容、总分 1.88 的 YouTube Shorts（小丑
+cosplay，2026-11-15 实测）也能凑出 2 个平台——它拿了爆发加分、发了
+提醒、还冲到 Top 10 第 2 名。所以规则 (c) 再加一条：最新快照的
+`item_count >= alert_min_items`（默认 10）**或** `total_score >=
+alert_min_total_score`（默认 5.0），满足其一才算爆发；两个都不满足
+时不产生 burst、不发提醒、Top 10 里没有爆发加分、Dashboard“正在爆发”
+一节里也没有它。`growth_spike` / `score_surge` 自带绝对增量门槛
+（翻倍 + 增量 ≥ 100/小时 / ≥ 5.0），不受这条影响。阈值是初始假设，
+未校准，在 `config.yaml` 的 `burst:` 一节里改。
+
+**重复出现（2026-11-15）：** 每小时直播这种标题（马拉雅拉姆语小时
+直播，2026-11-15 实测）每小时换一个新事件 id、每次都拿爆发加分、
+天天霸榜。`detect_bursts` 给每个 `new_multi_platform` burst 打
+`is_recurrence` 标记：库里已有一个更早的同名多平台事件时为真——
+更早 = `first_seen` 严格早于本事件、且落在最近
+`recurrence_window_hours` 小时（默认 24）内；同名 = 原名归一化后
+相同（小写、空白折叠）；多平台 = 那个事件最新快照的
+`platform_count >= 2`。判断函数是 `trend_radar/burst.py::is_recurrence`
+（collector 和 Dashboard Top 10 共用这一个入口，不各自再查库）。
+重复出现的效果：(a) collector 不发 Telegram 提醒（记一条
+“重复出现 … 个，不发提醒”日志，round 汇总里 `bursts_recurrence`
+单独计数）；(b) Top 10 排名里爆发分量记 0、新鲜度分量记 0、原因里
+不写“首次出现”（增长、成员强度、跨平台分量是真实的，照常算）。
+轮内同名去重（同名爆发只发一条提醒）不受影响，重复出现是它的
+跨轮次补充。不做标题黑名单（不硬编码“Top Headlines Of The Hour”
+这类字符串），规则是通用的。代价：同一标题的真新事件在窗口期内
+也会被压住；窗口就是调这个的旋钮。`growth_spike` / `score_surge`
+是老事件的变化信号，不按重复出现处理。
 
 阈值在 `config.yaml` 的 `burst:` 一节里：
 
@@ -107,6 +137,9 @@ burst:
   score_multiplier: 2.0
   score_min_delta: 5.0
   new_event_min_platforms: 2
+  alert_min_items: 10
+  alert_min_total_score: 5.0
+  recurrence_window_hours: 24
 ```
 
 **为什么每个规则都有“绝对增量”兜底：** 只看倍数会被小基数骗过
@@ -114,18 +147,24 @@ burst:
 同时满足才算爆发。
 
 **返回值：** burst 列表（按最新 total_score 降序），每项含
-`event_id`、`name`、`reasons`（命中的规则名）、`current`（最新
-快照值）、`previous`（上一轮快照值，规则 (c) 时为 `None`）、
-`detected_at`。没有爆发时返回 `[]`。只有一条快照的事件，
-规则 (a)(b) 无从比较，不触发；只有规则 (c) 会触发。
+`event_id`、`name`、`reasons`（命中的规则名）、`is_recurrence`
+（`new_multi_platform` 里同名事件在窗口内已跨平台出现过；其他
+规则恒为 `False`）、`current`（最新快照值）、`previous`（上一轮
+快照值，规则 (c) 时为 `None`）、`detected_at`。没有爆发时返回 `[]`。
+只有一条快照的事件，规则 (a)(b) 无从比较，不触发；只有规则 (c)
+会触发（还要过最低质量门槛）。
 
 ## 4. 测试
 
 - `tests/test_events.py`（7 个）：同一事件两轮聚类保持同一 id；
   同名不同期短标题拿到不同 id；persist 两轮后 first_seen 不后移、
   快照各追加一行；`cluster_from_db` 的结果带稳定 event_id。
-- `tests/test_burst.py`（6 个）：增长尖峰、总分跃升、新事件跨平台
-  均被检出；平坦历史、单快照单平台、小基数增长均不触发。
+- `tests/test_burst.py`：增长尖峰、总分跃升、新事件跨平台
+  均被检出；平坦历史、单快照单平台、小基数增长均不触发；另有
+  最低质量门槛测试（7 条/1.88 分不触发，10 条或 5.0 分触发，
+  边界与自定义阈值）与重复出现测试（同名 1 小时后出现判重复、
+  25 小时后/改名/早先单平台不判重复、窗口关闭不判重复、
+  growth_spike / score_surge 不受门槛影响）。
 - `tests/test_collector_events.py`（1 个）：`collect_once` 不跑任何
   adapter 时，已入库内容仍被聚类持久化；第二轮同一 event_id、
   快照追加一行。
