@@ -192,6 +192,41 @@ class TestAppleScript(unittest.TestCase):
         result, _ = self._run(stdout="", returncode=1, stderr="something else broke")
         self.assertEqual(result["reason"], "applescript_error")
 
+    def test_template_uses_index_based_tab_specifiers(self):
+        tpl = muse_chat.APPLESCRIPT_TEMPLATE
+        self.assertIn("repeat with wi from 1 to count of windows", tpl)
+        self.assertIn("repeat with ti from 1 to count of tabs of window wi", tpl)
+        self.assertIn("execute javascript jsCode in tab ti of window wi", tpl)
+        # 循环变量不能再传给 execute javascript（2026-11-15 实测报 -1700）。
+        self.assertNotIn("repeat with t in tabs", tpl)
+        self.assertNotIn("execute javascript jsCode in t\n", tpl)
+
+    def test_js_blocked_minus_1700(self):
+        # 用户 2026-11-15 在 Mac 上的真实报错。
+        result, _ = self._run(
+            stdout="",
+            returncode=1,
+            stderr=(
+                "/tmp/x/muse_chat_send.scpt:375:405: execution error: "
+                "Google Chrome got an error: Can’t make application "
+                '"Google Chrome" into type specifier. (-1700)'
+            ),
+        )
+        self.assertEqual(result["reason"], "applescript_js_blocked")
+
+    def test_js_blocked_type_specifier_without_code(self):
+        result, _ = self._run(
+            stdout="", returncode=1, stderr="Can't make application into type specifier"
+        )
+        self.assertEqual(result["reason"], "applescript_js_blocked")
+
+    def test_js_blocked_hint_mentions_chrome_setting(self):
+        with self.assertLogs(muse_chat.logger, level="WARNING") as logs:
+            muse_chat._log_send_failure({"reason": "applescript_js_blocked"})
+        combined = "\n".join(logs.output)
+        self.assertIn("Allow JavaScript from Apple Events", combined)
+        self.assertIn("自动化权限", combined)
+
     def test_timeout(self):
         result, _ = self._run(side_effect=subprocess.TimeoutExpired("osascript", 30))
         self.assertEqual(result, {"ok": False, "reason": "applescript_timeout"})

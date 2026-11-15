@@ -1,7 +1,9 @@
 # Muse 对话提醒：爆发事件打进浏览器输入框
 
 - 日期：2026-11-15
-- 状态：已实现并测试（mock），未在真机 Chrome 上实测。
+- 状态：已实现并测试（mock）；2026-11-15 用户 Mac 上第一次实测报 -1700
+  （标签页已找到，`execute javascript` 被挡），已修模板并补了 Chrome
+  开关说明，待用户再次实测。
 
 ## 这是什么
 
@@ -63,11 +65,19 @@ Telegram 提醒之外，爆发事件再打一份进用户自己 Chrome 里的 Mu
 ### macOS：AppleScript，不用装东西、不用重启 Chrome
 
 1. 打开 Chrome，登录 Muse，打开这个对话的标签页（保持开着）。
-2. 第一次跑扫描时，macOS 会弹一次权限：允许扫描器（终端 / Python）
-   控制 Google Chrome。点“允许”。
+2. Chrome 里开一个开关（macOS 的第一道门）：菜单栏 → View（视图）
+   → Developer（开发者）→ 勾选 Allow JavaScript from Apple Events。
+   当前 Chrome 默认是关闭的，没开的话 `execute javascript` 会报
+   -1700（2026-11-15 实测最常见的失败原因）。
+3. 第一次跑扫描时，macOS 会弹一次权限（第二道门）：允许扫描器
+   （终端 / Python）控制 Google Chrome。点“允许”。
    如果当时点了拒绝：系统设置 → 隐私与安全性 → 自动化，找到终端
    （或 Python），把 Google Chrome 的开关打开。
-3. 以后不用再管：每轮有爆发就自动打进来。
+   注意：第 2 步和第 3 步是两回事，各管各的：一个管 Chrome 允不允许
+   AppleScript 往页面里注入 JS，一个管 macOS 允不允许扫描器控制
+   Chrome。两处都要开，少一个都会失败（-1700 是第 2 步没开，
+   automation_denied 是第 3 步没给）。
+4. 以后不用再管：每轮有爆发就自动打进来。
 
 ### Windows：CDP，要重开一次 Chrome + 装一个依赖
 
@@ -101,8 +111,9 @@ python -m trend_radar.muse_chat --test "扫描器测试"
 
 这条命令发一条无害的测试消息（不是爆发提醒），然后清楚地报告：
 平台/方法、标签页找没找到、输入框找没找到（哪种输入框、按钮还是回车
-发送的）、发没发出。没发出时会给排查提示（macOS 看自动化权限，
-Windows 看 Chrome 调试端口）。**先跑通这条，再等真实爆发。**
+发送的）、发没发出。没发出时会给排查提示（macOS 看自动化权限和
+Chrome 的 Allow JavaScript from Apple Events，Windows 看 Chrome
+调试端口）。**先跑通这条，再等真实爆发。**
 
 ## 找不到输入框时怎么办
 
@@ -122,9 +133,16 @@ Windows 看 Chrome 调试端口）。**先跑通这条，再等真实爆发。**
 - **标签页必须开着**：页没开就发不出去（这时只走 Telegram）。
 - **选择器是尽力而为**：Muse 网页的真实 DOM 没法在没登录的机器上看，
   只能按常见形态写兜底；真机实测前不能保证一次就通，先跑 `--test`。
-- **AppleScript 的 `execute javascript`**：macOS 路线依赖 Chrome 的
-  AppleScript 支持；如果将来 Chrome 堵了这条路，macOS 也可以改
-  `method: cdp` 走 CDP（Chrome 同样加调试端口重开）。
+- **AppleScript 的 `execute javascript`（-1700 实测）**：2026-11-15
+  用户 Mac 上第一次实测就报了 -1700（Can't make application
+  "Google Chrome" into type specifier），标签页其实已经找到了，
+  是 `execute javascript` 这一步被挡了。两个原因都已处理：(1) 模板
+  改成显式序号定位（`tab ti of window wi`，循环变量传给
+  `execute javascript` 会触发 -1700）；(2) 没开 Chrome 的
+  Allow JavaScript from Apple Events 也会报 -1700，见上面设置步骤
+  第 2 步，报错原因现在单独记为 `applescript_js_blocked`，不再混
+  在通用的 applescript_error 里。如果将来 Chrome 彻底堵了这条路，
+  macOS 也可以改 `method: cdp` 走 CDP（Chrome 同样加调试端口重开）。
 - **Windows 上 Chrome 必须带调试端口启动**：没加参数重开的话，
   端口连不上，每轮只记一条提示，不会弹窗打扰。
 - 提醒正文与 Telegram 同文，但不截到 500 字（对话输入框没这个限制）；

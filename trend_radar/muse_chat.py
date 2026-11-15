@@ -10,6 +10,9 @@
 - macOS：AppleScript（系统自带，不用装东西、不用重启 Chrome）。
   首次运行 macOS 会弹权限：系统设置 → 隐私与安全性 → 自动化，
   允许扫描器（终端 / Python）控制 Google Chrome。
+  另外 Chrome 菜单栏 → View（视图）→ Developer（开发者）→
+  Allow JavaScript from Apple Events 也要勾选（当前 Chrome 默认
+  关闭，没开会报 -1700；与自动化权限是两回事，两处都要开）。
 - Windows：CDP（Chrome 自带的调试接口）。Chrome 要先完全退出，
   再加 --remote-debugging-port=9222 重开；还需要 websocket-client
  （在 requirements.txt 里，安装脚本会一起装；macOS 不需要它，
@@ -214,10 +217,14 @@ APPLESCRIPT_TEMPLATE = """on run argv
     return "NO_CHROME"
   end if
   tell application "Google Chrome"
-    repeat with w in windows
-      repeat with t in tabs of w
-        if (URL of t) contains urlMatch then
-          return execute javascript jsCode in t
+    -- 注意：必须用“tab ti of window wi”这种显式序号定位标签页。
+    -- 把循环变量直接传给 execute javascript 会报 -1700
+    -- （Can't make application "Google Chrome" into type
+    -- specifier），2026-11-15 实测。
+    repeat with wi from 1 to count of windows
+      repeat with ti from 1 to count of tabs of window wi
+        if (URL of tab ti of window wi) contains urlMatch then
+          return execute javascript jsCode in tab ti of window wi
         end if
       end repeat
     end repeat
@@ -239,6 +246,24 @@ def _looks_like_permission_denied(stderr: str) -> bool:
             "denied",
             "1743",
             "-10000",
+        )
+    )
+
+
+def _looks_like_js_blocked(stderr: str) -> bool:
+    """osascript 报错里是不是 Chrome 没开 JavaScript from Apple Events。
+
+    当前 Chrome 默认关闭这个开关时，execute javascript 会报 -1700
+    （Can't make application "Google Chrome" into type specifier），
+    与 macOS 自动化权限（automation_denied）是两回事。
+    """
+    lowered = (stderr or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "-1700",
+            "type specifier",
+            "allow javascript",
         )
     )
 
@@ -267,7 +292,12 @@ def _send_via_applescript(text: str, url_match: str) -> dict:
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
     if proc.returncode != 0:
-        reason = "automation_denied" if _looks_like_permission_denied(err) else "applescript_error"
+        if _looks_like_js_blocked(err):
+            reason = "applescript_js_blocked"
+        elif _looks_like_permission_denied(err):
+            reason = "automation_denied"
+        else:
+            reason = "applescript_error"
         return {"ok": False, "reason": reason, "detail": err[:300]}
     if out == "NO_CHROME":
         return {"ok": False, "reason": "chrome_not_running"}
@@ -368,6 +398,7 @@ def _log_send_failure(result: dict) -> None:
         "chrome_not_running": "Chrome 未运行：打开 Chrome 并登录 Muse 对话后，下一轮会自动再试",
         "no_muse_tab": "未找到 Muse 对话标签页：请在 Chrome 里打开 Muse 对话（URL 含 muse.ai），下一轮自动再试",
         "automation_denied": "macOS 未允许自动化：系统设置 → 隐私与安全性 → 自动化，允许扫描器/终端控制 Google Chrome（见 docs/MUSE_CHAT.md）",
+        "applescript_js_blocked": "Chrome 未开启 Apple Events 的 JavaScript 注入：Chrome 菜单栏 → View（视图）→ Developer（开发者）→ 勾选 Allow JavaScript from Apple Events（当前 Chrome 默认关闭，是 -1700 失败最常见的原因；与 macOS 自动化权限是两回事，两处都要开，见 docs/MUSE_CHAT.md）",
         "cdp_unreachable": "连不上 Chrome 调试端口：请完全退出 Chrome 后加 --remote-debugging-port=9222 重开（见 docs/MUSE_CHAT.md）",
         "websocket_client_missing": "缺少 websocket-client：运行 pip install -r requirements.txt（或重跑安装脚本）",
         "unsupported_platform": "当前平台不支持浏览器输入（仅 macOS / Windows）",
@@ -488,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"结果：未发送（{result.get('reason', 'unknown')}）")
     if result.get("detail"):
         print(f"详情：{result['detail']}")
-    print("排查见 docs/MUSE_CHAT.md（macOS 看自动化权限，Windows 看 Chrome 调试端口）。")
+    print("排查见 docs/MUSE_CHAT.md（macOS 看自动化权限和 Chrome 的 Allow JavaScript from Apple Events，Windows 看 Chrome 调试端口）。")
     return 1
 
 
