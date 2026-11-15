@@ -137,11 +137,22 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
     try:
         for item in deduped.values():
             row = conn.execute(
-                "SELECT id FROM items WHERE url = ?", (item.get("url", ""),)
+                "SELECT id, growth FROM items WHERE url = ?", (item.get("url", ""),)
             ).fetchone()
-            previous = 0.0
+            previous = None
+            previous_growth = 0.0
             if row:
-                previous = dbmod.previous_engagement(conn, int(row["id"]))
+                # 有上一轮快照：按真实增量算；同时读出上轮增速，供算加速度。
+                previous = dbmod.previous_snapshot(conn, int(row["id"]))
+                previous_growth = float(row["growth"] or 0)
+            if previous is None:
+                # 首次见到（没有任何快照）：本轮只作基线——增速记 0，
+                # 不把该内容此前的全部历史互动量当成一轮的增量。
+                # 快照照常存，下一轮开始算真实增量。否则一个有 12 万
+                # 播放的老视频第一次被采到时，会被算成 30,800/小时
+                # 的增速，霸占“增长最快”榜并污染事件 max_growth。
+                previous = float(item.get("engagement") or 0)
+                previous_growth = 0.0
             cross = len(title_platforms.get(item.get("title", "").strip().lower(), set()))
             # YouTube 快照是每 30 分钟一次，用 0.5 小时算增长才对；若仍用全局 0.25 小时，
             # 增长速度会被高估 2 倍。其他平台沿用全局扫描间隔。
@@ -151,6 +162,7 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
             result = score_item(
                 item,
                 previous_engagement=previous,
+                previous_growth=previous_growth,
                 interval_hours=item_hours,
                 cross_platform_count=max(1, cross),
             )

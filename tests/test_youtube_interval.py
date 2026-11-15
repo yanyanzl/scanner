@@ -21,14 +21,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from trend_radar import collector
 
 
-def _youtube_item():
+def _youtube_item(engagement: float = 1100.0):
     return {
         "platform": "youtube",
         "title": "Breaking news test video",
         "url": "https://www.youtube.com/watch?v=test123",
         "published_at": "2026-11-15T06:00:00+00:00",
         "first_seen": "2026-11-15T07:00:00+00:00",
-        "engagement": 1100.0,
+        "engagement": engagement,
         "views": 1000.0,
         "likes": 80.0,
         "comments": 20.0,
@@ -75,13 +75,22 @@ class TestYoutubeDue(unittest.TestCase):
 
 
 class TestYoutubeIntervalEndToEnd(unittest.TestCase):
-    def test_half_hour_gate_and_half_hour_growth(self):
-        """第一轮采 YouTube 且 growth 按 0.5 小时算；紧接着第二轮跳过。"""
+    def test_half_hour_gate_and_baseline_then_real_growth(self):
+        """第一轮采 YouTube：首次见到作基线，growth 0；紧接着第二轮跳过；
+        30 分钟后再采，growth 只算真实增量（按 0.5 小时）。
+
+        注意：2026-11-15 之前这里断言第一轮 growth 为 2200（1100 / 0.5），
+        那是首次见到虚高 bug 的表现——历史总量被当成一轮增量。
+        修正后第一轮是基线（growth 0），第二轮真实增量 550 才按
+        550 / 0.5 = 1100 算；若错用 0.25 小时则会是 2200。
+        """
         import tempfile
 
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
-            fetch = mock.Mock(return_value=[_youtube_item()])
+            fetch = mock.Mock(
+                side_effect=[[_youtube_item()], [_youtube_item(1650.0)]]
+            )
             with (
                 mock.patch.object(collector, "BASE_DIR", tmp),
                 mock.patch.object(collector.youtube, "fetch", fetch),
@@ -89,20 +98,30 @@ class TestYoutubeIntervalEndToEnd(unittest.TestCase):
             ):
                 first = collector.collect_once(_config())
                 second = collector.collect_once(_config())
-            self.assertEqual(fetch.call_count, 1)
+                # 把上次采集时间拨回 31 分钟前，模拟 30 分钟间隔已满。
+                state = tmp / "data" / ".youtube_last_run"
+                state.write_text(
+                    (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat(),
+                    encoding="utf-8",
+                )
+                third = collector.collect_once(_config())
+            self.assertEqual(fetch.call_count, 2)
             self.assertEqual(first["youtube"], 1)
             self.assertEqual(second["youtube"], 0)
+            self.assertEqual(third["youtube"], 1)
             self.assertTrue((tmp / "data" / ".youtube_last_run").exists())
             conn = sqlite3.connect(str(tmp / "data" / "trends.sqlite3"))
             try:
                 row = conn.execute(
                     "SELECT growth FROM items WHERE platform = 'youtube'"
                 ).fetchone()
+                snaps = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
             finally:
                 conn.close()
             self.assertIsNotNone(row)
-            # 1100 engagement / 0.5 小时 = 2200；若错用 0.25 小时则会是 4400。
-            self.assertEqual(row[0], 2200.0)
+            # 两轮都采到了，快照 2 行；第二轮真实增量 550 / 0.5 小时 = 1100。
+            self.assertEqual(snaps, 2)
+            self.assertEqual(row[0], 1100.0)
 
 
 if __name__ == "__main__":

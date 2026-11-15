@@ -127,6 +127,20 @@ def previous_engagement(conn: sqlite3.Connection, item_id: int) -> float:
     return float(row["engagement"]) if row else 0.0
 
 
+def previous_snapshot(conn: sqlite3.Connection, item_id: int) -> float | None:
+    """上一轮快照的互动量；从未有过快照时返回 None（不是 0）。
+
+    区分“没有快照”和“快照互动量为 0”很重要：首次见到的内容
+    必须按基线处理（见 collector.py），而不能把历史总量当成
+    一轮的增量。previous_engagement() 保留作兼容，它无法区分这两种情况。
+    """
+    row = conn.execute(
+        "SELECT engagement FROM snapshots WHERE item_id = ? ORDER BY collected_at DESC LIMIT 1",
+        (item_id,),
+    ).fetchone()
+    return float(row["engagement"]) if row else None
+
+
 def top_items(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM items ORDER BY score DESC, growth DESC LIMIT ?", (limit,)
