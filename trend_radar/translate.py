@@ -18,8 +18,12 @@
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
@@ -62,14 +66,82 @@ def needs_translation(text: str) -> bool:
 # 确认，见 docs/TRANSLATION.md）。
 AZURE_TRANSLATE_URL = "https://api.cognitive.microsofttranslator.com/translate"
 
-# 每轮 Azure 字符硬上限：1200 字/轮 × 24 轮/天 × 30 天 = 864,000 字/月，
-# 只有 F0 每月 200 万额度的约 43%（见 docs/TRANSLATION.md 的算术）。
-# 实际用量远低于上限（每轮约 10-15 条 × 约 60 字 ≈ 600-900 字）。
-AZURE_MAX_CHARS_PER_ROUND = 1200
+# 每轮 Azure 字符硬上限：600 字/轮 × 96 轮/天（15 分钟一轮）× 30 天
+# = 1,728,000 字/月；31 天的月份是 1,785,600 字——都低于用户定的
+# 1,800,000 字/月上限（见 docs/TRANSLATION.md 的算术）。光靠这个
+# 每轮上限，24/7 满负荷跑也烧不穿月度上限。实际用量还低于上限
+# （每轮约 10-15 条 × 约 60 字 ≈ 600-900 字，超 600 的部分留到下一轮）。
+# 月度总上限另有 data/.azure_usage.json 计数兜底（见下）。
+AZURE_MAX_CHARS_PER_ROUND = 600
+
+# Azure 月度字符上限（默认 1,800,000 = F0 每月 200 万的 90%，用户定）：
+# 见 load_azure_usage / record_azure_usage。每月按 UTC 月份切分。
+AZURE_MONTHLY_CAP_CHARS = 1800000
+AZURE_USAGE_FILENAME = ".azure_usage.json"
 
 
 class AzureUnavailable(Exception):
     """Azure 本轮不可用（429/403/401/网络错/返回异常）：调用方改走 DeepL。"""
+
+
+def azure_usage_month(now: datetime | None = None) -> str:
+    """当月（UTC）的用量月份键，形如 "2026-11"。"""
+    return (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+
+
+def load_azure_usage(path) -> tuple[str, int]:
+    """读 Azure 月度用量文件（{"month": "2026-11", "chars": N}）。
+
+    返回 (当月, 当月已用字符数)。文件缺失、内容损坏、字段不对时按
+    0 字处理（损坏记一条 warning）；存的是上个月时当月用量算 0
+    （跨月归零，不用等到下一次成功调用才重置）。
+    """
+    month = azure_usage_month()
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        stored_month = data["month"]
+        chars = data["chars"]
+        if (
+            not isinstance(stored_month, str)
+            or not re.fullmatch(r"\d{4}-\d{2}", stored_month)
+            or not isinstance(chars, int)
+            or isinstance(chars, bool)
+            or chars < 0
+        ):
+            raise ValueError("用量文件字段不对")
+    except FileNotFoundError:
+        return month, 0
+    except (OSError, ValueError, KeyError, TypeError):
+        logger.warning("Azure 月度用量文件损坏（%s），按 0 字处理", path)
+        return month, 0
+    if stored_month != month:
+        return month, 0
+    return month, chars
+
+
+def record_azure_usage(path, chars: int) -> int | None:
+    """把一次成功 Azure 请求的字符数累加进当月用量，原子写入。
+
+    只在调用方确认请求成功后调用（失败的请求不计）。跨月时先归零
+    再累加。写文件用临时文件 + os.replace，轮次中途崩溃也不会把
+    用量文件写坏。返回累加后当月总数；写失败时记一条 warning 并
+    返回 None（不影响本轮翻译结果，只影响用量统计）。
+    """
+    path = Path(path)
+    month, used = load_azure_usage(path)
+    total = used + max(0, int(chars))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps({"month": month, "chars": total}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("Azure 月度用量文件写入失败（%s）：%s", path, exc)
+        return None
+    return total
 
 
 def _parse_azure_response(data, texts: list[str]) -> dict[str, str]:
@@ -174,17 +246,21 @@ def azure_translate_many(
 
 
 # ---- DeepL（备用）----
-# Azure 不可用（没配 key、429/403、请求失败）时才走 DeepL。DeepL 按字符
-# 计费，免费额度有限——新注册只能选 Developer 计划：一次性 100 万字符，
-# 用完不恢复（旧版每月 50 万字符的 API Free 已停售）。所以 DeepL 同样
-# 只翻优先内容，每小时最多 1 次轮次（见 collector.py），字符硬上限与
-# Azure 相同。额度与注册步骤见 docs/TRANSLATION.md。
+# Azure 不可用（没配 key、429/403、请求失败、月度用量用完）时才走
+# DeepL。DeepL 按字符计费，免费额度有限——新注册只能选 Developer
+# 计划：一次性 100 万字符，用完不恢复（旧版每月 50 万字符的 API
+# Free 已停售）。所以 DeepL 同样只翻优先内容，**每小时最多 1 次
+# 轮次**（见 collector.py；Azure 每轮都跑，DeepL 不跟——每小时
+# 跑一次都够把 100 万总额在约 5 周内烧完）。额度与注册步骤见
+# docs/TRANSLATION.md。
 DEEPL_FREE_HOST = "api-free.deepl.com"
 DEEPL_PRO_HOST = "api.deepl.com"
 DEEPL_TRANSLATE_PATH = "/v2/translate"
 
-# 每轮 DeepL 字符硬上限：1200 字/轮 × 24 轮/天 × 30 天 = 864,000 字/月。
-# DeepL 只在 Azure 不可用时跑，实际用量远低于这个上限。
+# 每轮 DeepL 字符硬上限：1200 字/轮 × 24 轮/天（每小时最多 1 次）
+# × 30 天 = 864,000 字/月。DeepL 只在 Azure 不可用时跑，实际用量
+# 远低于这个上限；但注意它只有一次性 100 万字符总额——如果 Azure
+# 长期不可用、DeepL 每轮拉满，约 5 周就烧完（见 docs/TRANSLATION.md）。
 DEEPL_MAX_CHARS_PER_ROUND = 1200
 
 

@@ -108,10 +108,13 @@ _NEWS_APIS = (
 )
 
 
-# 翻译轮次间隔（分钟）：Azure 与 DeepL 都按字符计费，每小时最多 1 次
-# 翻译轮次（state 文件 data/.azure_last_run / data/.deepl_last_run），
-# 见 docs/TRANSLATION.md。
-TRANSLATION_INTERVAL_MINUTES = 60
+# DeepL 轮次间隔（分钟）：DeepL 免费额度是一次性 100 万字符（不是
+# 按月重置），所以 DeepL 每小时最多 1 次轮次（state 文件
+# data/.deepl_last_run，和 YouTube/GDELT 同一套间隔门控），见
+# docs/TRANSLATION.md。Azure 不再用间隔门控——每轮都跑，靠每轮
+# 600 字符上限 + 每月 180 万字符上限控用量（state 文件
+# data/.azure_usage.json）；旧的 data/.azure_last_run 不再使用。
+DEEPL_TRANSLATION_INTERVAL_MINUTES = 60
 
 # 翻译范围：只翻排名前 N 的事件（见 docs/TRANSLATION.md）。
 TOP_TRANSLATE_EVENTS = 5
@@ -125,7 +128,13 @@ def _translation_config(cfg: dict) -> dict:
     config.yaml 里有该节，enabled 默认为 true。
     azure_max_per_round / deepl_max_per_round 是每轮各提供方最多翻
     的文本条数（Top 5 事件名 + 爆发事件名 + 各事件分数最高的成员标题，
-    见 _collect_priority_texts）；字符硬上限在 translate.py 里。
+    见 _collect_priority_texts）；azure_max_chars_per_round 是 Azure
+    每轮字符硬上限（默认 600：600 × 96 轮/天 × 31 天 = 1,785,600，
+    低于月度上限 1,800,000，见 docs/TRANSLATION.md）；
+    azure_monthly_cap_chars 是 Azure 月度字符上限（默认 1,800,000，
+    用 data/.azure_usage.json 计数兜底）；DeepL 每轮字符硬上限
+    1200 在 translate.py 里（DeepL 每小时最多 1 次，不跟 Azure
+    每轮跑——它的一次性总额经不起每轮跑）。
     """
     section = cfg.get("translation")
     if not isinstance(section, dict):
@@ -134,12 +143,32 @@ def _translation_config(cfg: dict) -> dict:
             "target_lang": "zh-CN",
             "azure_max_per_round": 15,
             "deepl_max_per_round": 15,
+            "azure_max_chars_per_round": translate_mod.AZURE_MAX_CHARS_PER_ROUND,
+            "azure_monthly_cap_chars": translate_mod.AZURE_MONTHLY_CAP_CHARS,
         }
     return {
         "enabled": bool(section.get("enabled", True)),
         "target_lang": str(section.get("target_lang", "zh-CN")),
         "azure_max_per_round": int(section.get("azure_max_per_round", 15)),
         "deepl_max_per_round": int(section.get("deepl_max_per_round", 15)),
+        "azure_max_chars_per_round": max(
+            0,
+            int(
+                section.get(
+                    "azure_max_chars_per_round",
+                    translate_mod.AZURE_MAX_CHARS_PER_ROUND,
+                )
+            ),
+        ),
+        "azure_monthly_cap_chars": max(
+            0,
+            int(
+                section.get(
+                    "azure_monthly_cap_chars",
+                    translate_mod.AZURE_MONTHLY_CAP_CHARS,
+                )
+            ),
+        ),
     }
 
 
@@ -172,9 +201,10 @@ def _collect_priority_texts(
 ) -> list[dict]:
     """收集本轮要翻译的文本（按优先级排序，每条带上它的用途）。
 
-    顺序：爆发事件名（提醒当轮就要用中文名）→ Top 5 事件名 →
-    各目标事件分数最高的成员标题。同一文本只出现一次（事件名经常
-    就是它分数最高的成员标题），用途合并记录。
+    顺序：Top 5 事件名 → 爆发事件名 → 各目标事件分数最高的成员标题。
+    事件名在前、成员标题在后——每轮 600 字符预算不够时先砍成员标题，
+    事件名优先保住（提醒和榜单上先看到的都是事件名）。同一文本只
+    出现一次（事件名经常就是它分数最高的成员标题），用途合并记录。
     每条形如 {"text": ..., "events": {event_id, ...}, "items": {title, ...}}：
     events 是以该文本为事件名的事件，items 是以该文本为成员标题的条目。
     """
@@ -195,12 +225,12 @@ def _collect_priority_texts(
         if item_title:
             entry["items"].add(item_title)
 
+    for ev in top_events or []:
+        add(ev.get("name", ""), event_id=ev.get("event_id", ""))
     for burst in bursts or []:
         ev = events_by_id.get(burst.get("event_id", ""))
         if ev:
             add(ev.get("name", ""), event_id=ev.get("event_id", ""))
-    for ev in top_events or []:
-        add(ev.get("name", ""), event_id=ev.get("event_id", ""))
     target_ids: list[str] = []
     for ev in top_events or []:
         target_ids.append(ev.get("event_id", ""))
@@ -234,15 +264,17 @@ def _translate_priority_texts(
 ) -> tuple[int, int]:
     """翻本轮优先文本（Top 5 事件名 + 爆发事件名 + 各事件最高分成员标题）。
 
-    提供方顺序：Azure 主用（每小时最多 1 次，state 文件 data/.azure_last_run）；
-    Azure 不可用（没配 key、429/403、请求失败）时改走 DeepL 备用（每小时
-    最多 1 次，state 文件 data/.deepl_last_run）；两个都没配或都没到时间时
-    本轮不翻译。每轮只调一次提供方（Azure 一次请求打包全部文本；DeepL
-    逐条调）。已有中文名的事件/标题不再调接口；中文文本直接记原文为译文，
-    不占预算。失败的翻译不写库，下一轮再试。翻出的事件名同时写回 bursts
-    列表里的 name_zh（提醒当轮就能用中文名）与 events.name_zh；翻出的
-    成员标题写 items.title_zh。返回 (azure 翻出的条数, deepl 翻出的条数)。
-    本函数本身不抛异常。
+    提供方顺序：Azure 主用——**每轮都跑**（配了 key 就跑，没有每小时
+    门控）；月度用量用 data/.azure_usage.json 计数，剩余额度不够时
+    本轮只翻剩余额度内的文本、用完时整轮跳过 Azure。Azure 不可用
+    （没配 key、429/403、请求失败、月度用量用完）时改走 DeepL 备用
+    （每小时最多 1 次，state 文件 data/.deepl_last_run）；两个都没配
+    或 DeepL 也没到时间时本轮不翻译。每轮只调一次提供方（Azure 一次
+    请求打包全部文本；DeepL 逐条调）。已有中文名的事件/标题不再调接口；
+    中文文本直接记原文为译文，不占预算。失败的翻译不写库，下一轮再试。
+    翻出的事件名同时写回 bursts 列表里的 name_zh（提醒当轮就能用中文名）
+    与 events.name_zh；翻出的成员标题写 items.title_zh。返回
+    (azure 翻出的条数, deepl 翻出的条数)。本函数本身不抛异常。
     """
     if not tr_cfg.get("enabled", False):
         return 0, 0
@@ -317,37 +349,75 @@ def _translate_priority_texts(
                 burst["name_zh"] = name_zh
         return applied
 
-    azure_state_path = Path(db_path).parent / ".azure_last_run"
+    azure_usage_path = Path(db_path).parent / translate_mod.AZURE_USAGE_FILENAME
+    azure_monthly_cap = max(
+        0, int(tr_cfg.get("azure_monthly_cap_chars", translate_mod.AZURE_MONTHLY_CAP_CHARS))
+    )
+    azure_per_round_cap = max(
+        0, int(tr_cfg.get("azure_max_chars_per_round", translate_mod.AZURE_MAX_CHARS_PER_ROUND))
+    )
     deepl_state_path = Path(db_path).parent / ".deepl_last_run"
-    azure_due = bool(azure_key) and _youtube_due(azure_state_path, TRANSLATION_INTERVAL_MINUTES)
-    deepl_due = bool(deepl_key) and _youtube_due(deepl_state_path, TRANSLATION_INTERVAL_MINUTES)
+    deepl_due = bool(deepl_key) and _youtube_due(
+        deepl_state_path, DEEPL_TRANSLATION_INTERVAL_MINUTES
+    )
     azure_count = 0
     deepl_count = 0
     azure_attempted = False
     azure_ok = False
-    if azure_due:
+    if azure_key:
+        # Azure 每轮都跑（2026-11-15 用户决定：每 15 分钟一轮就翻一次，
+        # 不再每小时最多 1 次）。用量保障靠两层：每轮 600 字符硬上限
+        # （600 × 96 轮/天 × 31 天 = 1,785,600 < 1,800,000）+ 月度
+        # 上限（data/.azure_usage.json 计数，用完本轮跳过）。
         azure_attempted = True
-        try:
-            results, chars_used, _exhausted = translate_mod.azure_translate_many(
-                pending_texts,
-                azure_key,
-                region=azure_region,
-                max_texts=max(0, int(tr_cfg.get("azure_max_per_round", 15))),
-                max_chars=translate_mod.AZURE_MAX_CHARS_PER_ROUND,
+        _month, used = translate_mod.load_azure_usage(azure_usage_path)
+        remaining = azure_monthly_cap - used
+        if remaining <= 0:
+            logger.info(
+                "Azure 本月用量已达上限（%d/%d 字符），本轮跳过 Azure 翻译，改走 DeepL",
+                used,
+                azure_monthly_cap,
             )
-            azure_count = apply_results(results)
-            azure_ok = True
-            if results:
-                logger.info("Azure 本轮翻译优先文本 %d 条（%d 字符）", len(results), chars_used)
-        except translate_mod.AzureUnavailable:
-            pass  # 下面改走 DeepL；warning 已在 azure_translate_many 里记过
-        except Exception as exc:
-            logger.warning("Azure 翻译异常（本轮改走 DeepL）: %s", exc)
-        # 每次尝试后都记时间（成功或失败都一样），避免 429 后每 15 分钟又去撞一次。
-        _mark_youtube_run(azure_state_path)
+        else:
+            try:
+                results, chars_used, _exhausted = translate_mod.azure_translate_many(
+                    pending_texts,
+                    azure_key,
+                    region=azure_region,
+                    max_texts=max(0, int(tr_cfg.get("azure_max_per_round", 15))),
+                    max_chars=min(azure_per_round_cap, remaining),
+                )
+                azure_count = apply_results(results)
+                azure_ok = bool(results)
+                if results:
+                    # 只记成功请求的字符：失败的请求不计（azure_translate_many
+                    # 失败时抛异常、走不到这里）。
+                    monthly_total = translate_mod.record_azure_usage(
+                        azure_usage_path, chars_used
+                    )
+                    if monthly_total is None:
+                        logger.info(
+                            "Azure 本轮翻译优先文本 %d 条（%d 字符）",
+                            len(results),
+                            chars_used,
+                        )
+                    else:
+                        logger.info(
+                            "Azure 本轮翻译优先文本 %d 条（%d 字符），"
+                            "本月累计 %d/%d 字符",
+                            len(results),
+                            chars_used,
+                            monthly_total,
+                            azure_monthly_cap,
+                        )
+            except translate_mod.AzureUnavailable:
+                pass  # 下面改走 DeepL；warning 已在 azure_translate_many 里记过
+            except Exception as exc:
+                logger.warning("Azure 翻译异常（本轮改走 DeepL）: %s", exc)
     if not azure_ok:
-        # DeepL 备用：只有 Azure 没配 key 或本轮 Azure 失败时才跑；
-        # Azure 只是没到时间时不跑——翻译每小时最多 1 次，不翻倍。
+        # DeepL 备用：只有 Azure 没配 key 或本轮 Azure 没翻出东西时才跑
+        # （Azure 成功翻出时不跑——不翻倍；Azure 月度用量用完时也到这里，
+        # 同样按 DeepL 自己的每小时门控走）。
         deepl_may_run = (not azure_key) or azure_attempted
         if deepl_may_run and deepl_due:
             try:
@@ -556,9 +626,10 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
             bursts = detect_bursts(conn, thresholds=cfg.get("burst"))
             # 优先翻译：必须在排名与爆发检测之后、发提醒之前——
             # 只翻 Top 5 事件名 + 爆发事件名 + 各事件最高分成员标题
-            # （见 docs/TRANSLATION.md）。Azure 主用、DeepL 备用，
-            # 每小时最多 1 次；翻出的事件名当轮就写进 bursts 的 name_zh，
-            # 提醒里直接用中文名。失败不影响爆发检测与提醒。
+            # （见 docs/TRANSLATION.md）。Azure 每轮都跑（月度用量
+            # 封顶）、DeepL 每小时最多 1 次（备用）；翻出的事件名当轮
+            # 就写进 bursts 的 name_zh，提醒里直接用中文名。失败不影响
+            # 爆发检测与提醒。
             try:
                 top_events = _ranking_top_events(events, bursts, cfg)
                 azure_key = (
