@@ -24,6 +24,21 @@ def _connect(db_path: str | Path) -> sqlite3.Connection | None:
     return conn
 
 
+def _display_row(row: dict) -> dict:
+    """把一行里的标题换成中文标题（有 title_zh 时），原标题保留在
+    title_original 里；没有翻译时原样返回。
+
+    app.py 直接读 row["title"] 显示，所以在这里替换，app.py 不用改。
+    聚类键不受影响：聚类直接读数据库的原始 title，不走这里。
+    """
+    title_zh = (row.get("title_zh") or "").strip()
+    if title_zh and title_zh != row.get("title"):
+        row = dict(row)
+        row["title_original"] = row.get("title", "")
+        row["title"] = title_zh
+    return row
+
+
 def load_items(db_path: str | Path, platform: str = "全部", limit: int = DEFAULT_LIMIT) -> list[dict]:
     """按分数取 items；platform != "全部" 时只取该平台。缺 DB 返回 []。"""
     conn = _connect(db_path)
@@ -40,7 +55,7 @@ def load_items(db_path: str | Path, platform: str = "全部", limit: int = DEFAU
                 "SELECT * FROM items WHERE platform = ? ORDER BY score DESC, growth DESC LIMIT ?",
                 (platform, int(limit)),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [_display_row(dict(r)) for r in rows]
     except sqlite3.Error:
         return []
     finally:
@@ -56,7 +71,7 @@ def load_fastest(db_path: str | Path, limit: int = FASTEST_LIMIT) -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM items ORDER BY growth DESC LIMIT ?", (int(limit),)
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_display_row(dict(r)) for r in rows]
     except sqlite3.Error:
         return []
     finally:
@@ -82,19 +97,47 @@ def load_history(
     try:
         rows = conn.execute(
             """
-            SELECT s.collected_at AS t, i.title AS title, s.engagement AS engagement
+            SELECT s.collected_at AS t, i.title AS title, i.title_zh AS title_zh,
+                   s.engagement AS engagement
             FROM snapshots s JOIN items i ON i.id = s.item_id
             ORDER BY s.collected_at ASC
             """
         ).fetchall()
-    except sqlite3.Error:
-        return [], {}
+    except sqlite3.Error as exc:
+        # 老数据库还没有 title_zh 列（迁移只在 collector 打开数据库时跑）：
+        # 退回不带中文标题的旧查询，图表照常画，只是图例用原标题。
+        if "no such column" not in str(exc):
+            return [], {}
+        try:
+            rows = conn.execute(
+                """
+                SELECT s.collected_at AS t, i.title AS title,
+                       s.engagement AS engagement
+                FROM snapshots s JOIN items i ON i.id = s.item_id
+                ORDER BY s.collected_at ASC
+                """
+            ).fetchall()
+        except sqlite3.Error:
+            return [], {}
+        finally:
+            conn.close()
+        if not rows:
+            return [], {}
+        return _history_series(rows, use_zh=False, limit=limit)
     finally:
         conn.close()
     if not rows:
         return [], {}
+    return _history_series(rows, use_zh=True, limit=limit)
+
+
+def _history_series(
+    rows, use_zh: bool, limit: int
+) -> tuple[list[str], dict[str, list[float | None]]]:
+    """把快照行拼成 (时间点, {标题: 各时间点互动量})；use_zh 为真时图例用中文标题。"""
 
     # 每个标题只保留一个序列；标题过长时截断，避免图例过长。
+    # 图例用中文标题（有 title_zh 时），没有时用原标题。
     def short(title: str) -> str:
         title = (title or "").strip()
         return title if len(title) <= 40 else title[:37] + "…"
@@ -102,7 +145,9 @@ def load_history(
     by_title: dict[str, dict[str, float]] = {}
     for r in rows:
         t = str(r["t"])
-        by_title.setdefault(short(str(r["title"])), {})[t] = float(r["engagement"] or 0)
+        zh = (r["title_zh"] or "").strip() if use_zh else ""
+        display = zh or str(r["title"])
+        by_title.setdefault(short(display), {})[t] = float(r["engagement"] or 0)
     # 只要互动量曾经大于 0 的标题（全是 0 的是 RSS/GDELT，不画曲线）。
     by_title = {t: p for t, p in by_title.items() if max(p.values()) > 0}
     if not by_title:
@@ -131,7 +176,14 @@ def load_bursts(db_path: str | Path) -> list[dict]:
     try:
         from trend_radar.burst import detect_bursts, load_burst_config
 
-        return detect_bursts(conn, thresholds=load_burst_config())
+        bursts = detect_bursts(conn, thresholds=load_burst_config())
+        # 事件名优先显示中文名（app.py 直接读 b["name"]，这里替换就不用改 app.py）。
+        for b in bursts:
+            name_zh = (b.get("name_zh") or "").strip()
+            if name_zh and name_zh != b.get("name"):
+                b["name_original"] = b.get("name", "")
+                b["name"] = name_zh
+        return bursts
     except sqlite3.Error:
         return []
     finally:

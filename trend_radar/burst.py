@@ -69,7 +69,8 @@ def detect_bursts(
 ) -> list[dict]:
     """检测所有事件的爆发，返回 burst 列表（按最新 total_score 降序）。
 
-    每个 burst：event_id、name、reasons（命中的规则名）、current（最新快照
+    每个 burst：event_id、name、name_zh（有中文名时才有，没有为 None，
+    显示时回退到 name）、reasons（命中的规则名）、current（最新快照
     值）、previous（上一轮快照值，规则 (c) 时为 None）、detected_at。
     没有任何事件爆发时返回 []。
     """
@@ -84,9 +85,19 @@ def detect_bursts(
         detected_at = now
 
     bursts: list[dict] = []
-    event_rows = conn.execute("SELECT event_id, name FROM events").fetchall()
+    # name_zh 列是 2026-11-15 翻译功能加的；db.connect() 会给老库补列，
+    # 但 detect_bursts 也可能被直接连在老库上的调用方使用，先查有没有该列，
+    # 没有就只读 name（burst 里 name_zh 为 None，显示回退到原标题）。
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+    if "name_zh" in cols:
+        event_rows = conn.execute("SELECT event_id, name, name_zh FROM events").fetchall()
+    else:
+        event_rows = conn.execute("SELECT event_id, name FROM events").fetchall()
     for event_row in event_rows:
         event_id = event_row["event_id"]
+        name_zh = None
+        if "name_zh" in cols:
+            name_zh = (event_row["name_zh"] or "").strip() or None
         snaps = conn.execute(
             """
             SELECT * FROM event_snapshots
@@ -121,6 +132,7 @@ def detect_bursts(
                 {
                     "event_id": event_id,
                     "name": event_row["name"],
+                    "name_zh": name_zh,
                     "reasons": reasons,
                     "current": current,
                     "previous": previous,

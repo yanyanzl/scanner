@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS items (
     source TEXT,
     language TEXT,
     summary_zh TEXT,
+    title_zh TEXT,
     score REAL DEFAULT 0,
     growth REAL DEFAULT 0,
     acceleration REAL DEFAULT 0,
@@ -40,6 +41,7 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_item ON snapshots (item_id, collected_a
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    name_zh TEXT,
     first_seen TEXT,
     last_seen TEXT,
     platform_count INTEGER DEFAULT 1,
@@ -64,14 +66,39 @@ CREATE INDEX IF NOT EXISTS idx_event_snapshots_event ON event_snapshots (event_i
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """给已存在的老数据库补列（新库建表时已有这些列）。
+
+    和 events 表当初的做法一样：CREATE TABLE IF NOT EXISTS 只负责建表，
+    老库靠这里补列，第一次连接时自动完成，不用手动迁移。
+    """
+    for table, column in (("items", "title_zh"), ("events", "name_zh")):
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def set_item_title_zh(conn: sqlite3.Connection, item_id: int, title_zh: str) -> None:
+    """写一条内容的中文标题（翻译完成后调用；调用方负责 commit 或复用连接）。"""
+    conn.execute("UPDATE items SET title_zh = ? WHERE id = ?", (title_zh, int(item_id)))
+    conn.commit()
+
+
+def set_event_name_zh(conn: sqlite3.Connection, event_id: str, name_zh: str) -> None:
+    """写一个事件的中文名（翻译完成后调用）。"""
+    conn.execute("UPDATE events SET name_zh = ? WHERE event_id = ?", (name_zh, event_id))
+    conn.commit()
 
 
 def upsert_item(conn: sqlite3.Connection, item: dict, score_result: dict) -> int:
@@ -80,15 +107,18 @@ def upsert_item(conn: sqlite3.Connection, item: dict, score_result: dict) -> int
         """
         INSERT INTO items
             (platform, title, url, published_at, first_seen, source, language,
-             summary_zh, score, growth, acceleration, age_hours, collected_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             summary_zh, title_zh, score, growth, acceleration, age_hours, collected_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(url) DO UPDATE SET
             title=excluded.title,
             score=excluded.score,
             growth=excluded.growth,
             acceleration=excluded.acceleration,
             age_hours=excluded.age_hours,
-            collected_at=excluded.collected_at
+            collected_at=excluded.collected_at,
+            title_zh=CASE
+                WHEN excluded.title_zh IS NOT NULL AND excluded.title_zh != ''
+                THEN excluded.title_zh ELSE items.title_zh END
         """,
         (
             item.get("platform", ""),
@@ -99,6 +129,7 @@ def upsert_item(conn: sqlite3.Connection, item: dict, score_result: dict) -> int
             item.get("source", ""),
             item.get("language", ""),
             item.get("summary_zh", ""),
+            item.get("title_zh"),
             score_result.get("score", 0),
             score_result.get("growth", 0),
             score_result.get("acceleration", 0),

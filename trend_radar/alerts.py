@@ -35,9 +35,11 @@ def format_burst_message(burst: dict) -> str:
     current = burst.get("current") or {}
     previous = burst.get("previous") or None
     reasons = [REASON_WORDS.get(r, r) for r in (burst.get("reasons") or [])]
+    # 事件名优先用中文名（翻译功能写进 events.name_zh），没有时回退到原标题。
+    display_name = (burst.get("name_zh") or burst.get("name") or "").strip()
     lines = [
         "🚨 热点爆发提醒",
-        f"事件：{burst.get('name', '')}",
+        f"事件：{display_name}",
         f"原因：{'、'.join(reasons) if reasons else '爆发'}",
     ]
     platforms = (current.get("platforms") or "").strip()

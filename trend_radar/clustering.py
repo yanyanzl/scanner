@@ -171,11 +171,14 @@ def persist_events(
         conn.execute(
             """
             INSERT INTO events
-                (event_id, name, first_seen, last_seen, platform_count,
+                (event_id, name, name_zh, first_seen, last_seen, platform_count,
                  item_count, total_score, max_score, max_growth)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(event_id) DO UPDATE SET
                 name=excluded.name,
+                name_zh=CASE
+                    WHEN excluded.name_zh IS NOT NULL AND excluded.name_zh != ''
+                    THEN excluded.name_zh ELSE events.name_zh END,
                 first_seen=min(events.first_seen, excluded.first_seen),
                 last_seen=excluded.last_seen,
                 platform_count=excluded.platform_count,
@@ -187,6 +190,7 @@ def persist_events(
             (
                 event_id,
                 ev.get("name", ""),
+                ev.get("name_zh"),
                 first_seen,
                 now_iso,
                 int(ev.get("platform_count", 1)),
@@ -282,10 +286,15 @@ def cluster_items(
         total_score = round(sum(float(it.get("score") or 0) for it in member_items), 4)
         max_score = round(max(float(it.get("score") or 0) for it in member_items), 4)
         max_growth = round(max(float(it.get("growth") or 0) for it in member_items), 2)
+        # 事件中文名：取代表标题（分数最高成员）的 title_zh；该成员还没翻
+        # 出来时留空，collector 在 persist 之后再补翻（见 collector.py）。
+        # 聚类键（canonical_event_id）始终用原始标题算，不受翻译影响。
+        rep_title_zh = (representative.get("title_zh") or "").strip()
         events.append(
             {
                 "event_id": canonical_event_id(member_items),
                 "name": representative.get("title", ""),
+                "name_zh": rep_title_zh or None,
                 "first_seen": min(times).isoformat() if times else None,
                 "platforms": platforms,
                 "platform_count": len(platforms),
@@ -297,6 +306,7 @@ def cluster_items(
                 "items": [
                     {
                         "title": it.get("title", ""),
+                        "title_zh": it.get("title_zh") or it.get("title", ""),
                         "platform": it.get("platform", ""),
                         "url": it.get("url", ""),
                         "score": float(it.get("score") or 0),

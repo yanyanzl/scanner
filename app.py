@@ -103,7 +103,7 @@ else:
     st.dataframe(
         [
             {
-                "事件": ev.get("name", ""),
+                "事件": ev.get("name_zh") or ev.get("name", ""),
                 "平台数": ev.get("platform_count", 0),
                 "平台": ", ".join(ev.get("platforms", [])),
                 "条数": ev.get("item_count", 0),

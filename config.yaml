@@ -58,6 +58,19 @@ sources:
 telegram:
   enabled: true
 
+# 标题自动翻译（免费）：非中文标题翻成中文再显示/提醒。
+# 用 Google 免费翻译接口的非官方 client=gtx 端点，无需 key；可能被限流
+# 或屏蔽，失败时自动回退到原标题，不影响采集。翻译结果缓存在数据库
+# （items.title_zh / events.name_zh），同一标题只翻一次；每轮最多调
+# max_per_round 次接口，中文标题不调接口、不占预算。见 docs/TRANSLATION.md。
+translation:
+  enabled: true
+  target_lang: zh-CN
+  max_per_round: 30
+  # 两次翻译接口调用之间等 0.5 秒：免费接口对连续请求很敏感，
+  # 30 条连发容易直接 429；慢一点反而更容易翻出来。失败不存 title_zh，
+  # 下一轮会再试（见 collector.py）；中文标题不调接口、不占预算。
+
 # P1 事件聚类 v0.1（本地 TF-IDF + 余弦相似度 + 并查集，无新依赖）
 # similarity_threshold 是初始假设，需用真实多平台数据校准，见 docs/P1_CLUSTERING.md
 clustering:
