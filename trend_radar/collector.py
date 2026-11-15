@@ -739,6 +739,34 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
                     logger.warning("Telegram 提醒异常（不影响采集）: %s", exc)
                     counts["alerts_sent"] = 0
                     counts["alerts_failed"] = len(alert_bursts)
+                # Muse 对话提醒：与 Telegram 发同一批 alert_bursts
+                # （已过质量门槛、去重、重复出现过滤），每条消息首行是
+                # 结构化标记（见 trend_radar/muse_chat.py），由浏览器
+                # 程序打进用户自己的 Chrome Muse 对话框。只受
+                # muse_chat.enabled 控制，与 telegram.enabled 无关。
+                # 失败只记 warning，不影响本轮采集结果。见 docs/MUSE_CHAT.md。
+                try:
+                    from trend_radar.muse_chat import send_alerts_to_muse_chat
+
+                    if cfg.get("muse_chat", {}).get("enabled", True) and alert_bursts:
+                        muse_result = send_alerts_to_muse_chat(
+                            alert_bursts, cfg.get("muse_chat") or {}
+                        )
+                        counts["muse_chat_sent"] = muse_result["sent"]
+                        counts["muse_chat_failed"] = len(muse_result["failed"])
+                        if muse_result["failed"]:
+                            logger.warning(
+                                "Muse 对话提醒失败 %d 条: %s",
+                                len(muse_result["failed"]),
+                                muse_result["failed"],
+                            )
+                    else:
+                        counts["muse_chat_sent"] = 0
+                        counts["muse_chat_failed"] = 0
+                except Exception as exc:  # 提醒失败不影响采集结果
+                    logger.warning("Muse 对话提醒异常（不影响采集）: %s", exc)
+                    counts["muse_chat_sent"] = 0
+                    counts["muse_chat_failed"] = len(alert_bursts)
         except Exception as exc:  # 聚类/持久化失败不影响采集结果
             logger.warning("事件聚类/持久化失败（不影响采集）: %s", exc)
             counts["events"] = 0

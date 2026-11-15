@@ -4,3 +4,7 @@ streamlit
 pyyaml
 requests
 python-dotenv
+# Windows 上 Muse 对话提醒（CDP）才用：连 Chrome 调试端口的 websocket
+# 客户端。macOS 的 AppleScript 路线不需要它，模块里是懒加载，缺了
+# 也不影响 import（见 trend_radar/muse_chat.py）。
+websocket-client
