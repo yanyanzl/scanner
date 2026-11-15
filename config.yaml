@@ -52,3 +52,14 @@ clustering:
   similarity_threshold: 0.35
   min_platforms: 1
   time_window_hours: 24
+
+# P2 准备：爆发检测阈值（初始假设，需用真实快照数据校准，见 docs/P2_PREP.md）
+# growth_spike：最新 max_growth 相对上一轮翻 growth_multiplier 倍以上，
+#   且绝对增量不小于 growth_min_delta；score_surge 同理；
+# new_event_min_platforms：首次出现即跨 >= 该数个平台的事件视为爆发。
+burst:
+  growth_multiplier: 2.0
+  growth_min_delta: 100.0
+  score_multiplier: 2.0
+  score_min_delta: 5.0
+  new_event_min_platforms: 2

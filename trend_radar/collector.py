@@ -157,6 +157,29 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
             item_id = dbmod.upsert_item(conn, item, result)
             dbmod.record_snapshot(conn, item_id, float(item.get("engagement") or 0), result["score"])
             saved += 1
+
+        # P2 准备：每轮采集后聚类并持久化事件快照（失败不影响本轮采集）。
+        # 只有接在这里，events / event_snapshots 才会随扫描自动积累，
+        # 事件才有跨轮次的稳定 ID 与可比的历史，爆发检测才有上一轮可比。
+        try:
+            from trend_radar.burst import detect_bursts
+            from trend_radar.clustering import cluster_from_db, persist_events
+
+            events = cluster_from_db(db_path)
+            persist_events(conn, events)
+            bursts = detect_bursts(conn, thresholds=cfg.get("burst"))
+            counts["events"] = len(events)
+            counts["bursts"] = len(bursts)
+            if bursts:
+                logger.info(
+                    "爆发事件 %d 个: %s",
+                    len(bursts),
+                    "; ".join(f"{b['name']}({','.join(b['reasons'])})" for b in bursts),
+                )
+        except Exception as exc:  # 聚类/持久化失败不影响采集结果
+            logger.warning("事件聚类/持久化失败（不影响采集）: %s", exc)
+            counts["events"] = 0
+            counts["bursts"] = 0
     finally:
         conn.close()
 

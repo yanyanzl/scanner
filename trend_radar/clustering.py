@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -101,6 +102,121 @@ class _UnionFind:
             self.parent[rb] = ra
 
 
+def _representative(member_items: list[dict]) -> dict:
+    return max(
+        member_items, key=lambda it: (float(it.get("score") or 0), float(it.get("growth") or 0))
+    )
+
+
+def canonical_event_id(member_items: list[dict]) -> str:
+    """给一个聚类事件算稳定的 event_id（P2 准备，见 docs/P2_PREP.md）。
+
+    方案：取“核心词”——在至少 2 个成员标题里都出现的 token，去重排序；
+    如果核心词不足 2 个（单条事件、或成员措辞几乎没有重合），退回用
+    代表标题（分数最高成员）的全部 token。再对排序后的 token 列表取
+    SHA-256，前 16 位十六进制，加 `evt_` 前缀。
+
+    为什么不用代表标题本身：代表标题会随分数变化而换人，id 会跟着变；
+    核心词是事件多个标题的交集，比单个标题稳定。
+
+    短标题保护：如果核心 token 少于 3 个，追加最早成员 URL 的短 hash
+    （`u:<sha1(url) 前 12 位>`）作区分。没有这一步，同名不同期的短标题
+    （如 BBC "Tech Now" 的不同期节目）会算出同一个 id 而被错误合并——
+    它们在 cluster_items 里本来就是分开的两个事件。代价：如果最早那条
+    滑出时间窗口，id 可能变化；这是本方案已知的局限。
+    """
+    docs = [set(tokenize(it.get("title", ""))) for it in member_items]
+    counts: Counter = Counter()
+    for tokens in docs:
+        for tok in tokens:
+            counts[tok] += 1
+    shared = sorted(tok for tok, n in counts.items() if n >= 2)
+    if len(shared) >= 2:
+        canonical = shared
+    else:
+        canonical = sorted(set(tokenize(_representative(member_items).get("title", ""))))
+    key_parts = list(canonical)
+    if len(canonical) < 3:
+        times = [(t, it) for it in member_items for t in [_item_time(it)] if t is not None]
+        earliest = min(times, key=lambda x: x[0])[1] if times else member_items[0]
+        url_hash = hashlib.sha1((earliest.get("url", "") or "").encode("utf-8")).hexdigest()[:12]
+        key_parts.append(f"u:{url_hash}")
+    digest = hashlib.sha256("|".join(key_parts).encode("utf-8")).hexdigest()[:16]
+    return f"evt_{digest}"
+
+
+def persist_events(
+    conn: sqlite3.Connection,
+    events: list[dict],
+    now: datetime | str | None = None,
+) -> None:
+    """把一轮聚类结果写进 events / event_snapshots 表。
+
+    每个事件：upsert events 行（first_seen 取历史最早值，绝不往后挪；
+    last_seen 和各项指标更新为本轮的值），并在 event_snapshots 里追加
+    一行。空列表时什么也不做。调用方负责在跑完一批事件后 commit；
+    这里每调一次 commit 一次，方便单步调用。
+    """
+    if not events:
+        return
+    if now is None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+    elif isinstance(now, datetime):
+        now_iso = now.isoformat()
+    else:
+        now_iso = now
+    for ev in events:
+        event_id = ev.get("event_id") or canonical_event_id(ev.get("items", []))
+        first_seen = ev.get("first_seen") or now_iso
+        conn.execute(
+            """
+            INSERT INTO events
+                (event_id, name, first_seen, last_seen, platform_count,
+                 item_count, total_score, max_score, max_growth)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                name=excluded.name,
+                first_seen=min(events.first_seen, excluded.first_seen),
+                last_seen=excluded.last_seen,
+                platform_count=excluded.platform_count,
+                item_count=excluded.item_count,
+                total_score=excluded.total_score,
+                max_score=excluded.max_score,
+                max_growth=excluded.max_growth
+            """,
+            (
+                event_id,
+                ev.get("name", ""),
+                first_seen,
+                now_iso,
+                int(ev.get("platform_count", 1)),
+                int(ev.get("item_count", 1)),
+                float(ev.get("total_score") or 0),
+                float(ev.get("max_score") or 0),
+                float(ev.get("max_growth") or 0),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO event_snapshots
+                (event_id, collected_at, item_count, platform_count,
+                 total_score, max_score, max_growth, platforms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                now_iso,
+                int(ev.get("item_count", 1)),
+                int(ev.get("platform_count", 1)),
+                float(ev.get("total_score") or 0),
+                float(ev.get("max_score") or 0),
+                float(ev.get("max_growth") or 0),
+                ",".join(ev.get("platforms") or []),
+            ),
+        )
+    conn.commit()
+
+
 def _item_time(item: dict) -> datetime | None:
     return parse_dt(item.get("first_seen")) or parse_dt(item.get("published_at"))
 
@@ -161,15 +277,14 @@ def cluster_items(
         platforms = sorted({it.get("platform", "") for it in member_items if it.get("platform")})
         if len(platforms) < max(1, int(min_platforms)):
             continue
-        representative = max(
-            member_items, key=lambda it: (float(it.get("score") or 0), float(it.get("growth") or 0))
-        )
+        representative = _representative(member_items)
         times = [t for t in (_item_time(it) for it in member_items) if t is not None]
         total_score = round(sum(float(it.get("score") or 0) for it in member_items), 4)
         max_score = round(max(float(it.get("score") or 0) for it in member_items), 4)
         max_growth = round(max(float(it.get("growth") or 0) for it in member_items), 2)
         events.append(
             {
+                "event_id": canonical_event_id(member_items),
                 "name": representative.get("title", ""),
                 "first_seen": min(times).isoformat() if times else None,
                 "platforms": platforms,

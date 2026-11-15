@@ -33,6 +33,34 @@ CREATE TABLE IF NOT EXISTS snapshots (
 CREATE INDEX IF NOT EXISTS idx_items_score ON items (score DESC);
 CREATE INDEX IF NOT EXISTS idx_items_platform ON items (platform);
 CREATE INDEX IF NOT EXISTS idx_snapshots_item ON snapshots (item_id, collected_at);
+-- P2 准备：跨轮次事件身份 + 事件快照（2026-11-15）
+-- events 存每个事件的最新状态；event_snapshots 每轮为每个事件追加一行，
+-- 用于算事件级增长/加速度和爆发检测。CREATE TABLE IF NOT EXISTS，
+-- 老数据库第一次连接时自动建表，不用手动迁移。
+CREATE TABLE IF NOT EXISTS events (
+    event_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    first_seen TEXT,
+    last_seen TEXT,
+    platform_count INTEGER DEFAULT 1,
+    item_count INTEGER DEFAULT 1,
+    total_score REAL DEFAULT 0,
+    max_score REAL DEFAULT 0,
+    max_growth REAL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS event_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    collected_at TEXT NOT NULL,
+    item_count INTEGER DEFAULT 1,
+    platform_count INTEGER DEFAULT 1,
+    total_score REAL DEFAULT 0,
+    max_score REAL DEFAULT 0,
+    max_growth REAL DEFAULT 0,
+    platforms TEXT DEFAULT '',
+    FOREIGN KEY (event_id) REFERENCES events (event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_snapshots_event ON event_snapshots (event_id, collected_at);
 """
 
 
