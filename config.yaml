@@ -23,6 +23,11 @@ sources:
     enabled: true
     query: "technology OR breaking news"
     max_records: 50
+    # GDELT 单独放宽到每 60 分钟 1 次（不是每 15 分钟）：2026-11-15 连续 3 次
+    # 失败（两次 HTTP 429、一次返回限流提示文本而非 JSON），见
+    # trend_radar/adapters/gdelt.py。GDELT 没有互动量数据，降频对增长
+    # 计算几乎没有损失；被限流后 gdelt.py 内部还会退避重试（最多 3 次）。
+    interval_minutes: 60
   reddit:
     enabled: true  # 已开启：无凭证时 adapter 返回 [] 并记“未启用”，填好 REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET 后自动采集
     subreddits:
@@ -45,6 +50,13 @@ sources:
   tiktok:
     enabled: false  # 需要官方授权数据接口，当前为预留 stub，不采集
     queries: []
+
+# P3 Telegram 实时提醒（免费 Bot API）：爆发事件在 1 分钟内推送到 Telegram。
+# 凭证不放这里，放本地 .env：TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID。
+# 未配凭证时自动跳过、不发任何请求；enabled: false 可彻底关闭提醒。
+# 设置步骤见 docs/P3_ALERTS.md。
+telegram:
+  enabled: true
 
 # P1 事件聚类 v0.1（本地 TF-IDF + 余弦相似度 + 并查集，无新依赖）
 # similarity_threshold 是初始假设，需用真实多平台数据校准，见 docs/P1_CLUSTERING.md

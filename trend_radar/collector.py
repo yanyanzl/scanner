@@ -99,8 +99,21 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
 
     if sources.get("rss", {}).get("enabled", True):
         run("rss", lambda: rss.fetch(sources["rss"].get("feeds", [])))
-    if sources.get("gdelt", {}).get("enabled", True):
-        run("gdelt", lambda: gdelt.fetch(sources["gdelt"].get("query", "")))
+    # GDELT 单独间隔（默认 60 分钟，见 config.yaml）：2026-11-15 连续 3 次失败
+    # （两次 429、一次返回限流提示文本而非 JSON），gdelt.py 里已加退避重试，
+    # 这里再把频率从每 15 分钟降到每小时 1 次。GDELT 没有互动量数据，
+    # 降频对增长计算几乎没有损失；每次尝试后都记时间（成功或被限流都一样），
+    # 避免限流后每 15 分钟又去撞一次。
+    gdelt_cfg = sources.get("gdelt", {})
+    if gdelt_cfg.get("enabled", True):
+        gdelt_interval_minutes = int(gdelt_cfg.get("interval_minutes", 60))
+        gdelt_state_path = Path(db_path).parent / ".gdelt_last_run"
+        if _youtube_due(gdelt_state_path, gdelt_interval_minutes):
+            run("gdelt", lambda: gdelt.fetch(gdelt_cfg.get("query", "")))
+            _mark_youtube_run(gdelt_state_path)
+        else:
+            counts["gdelt"] = 0
+            logger.info("GDELT 本轮跳过：未满 %d 分钟间隔", gdelt_interval_minutes)
     if sources.get("reddit", {}).get("enabled", False):
         run("reddit", lambda: reddit.fetch(sources["reddit"].get("subreddits", [])))
     if youtube_cfg.get("enabled", False):
@@ -203,6 +216,29 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
                     len(bursts),
                     "; ".join(f"{b['name']}({','.join(b['reasons'])})" for b in bursts),
                 )
+                # P3 Telegram 提醒：未配 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+                # 时 send_burst_alerts 直接跳过、不发任何请求；发送失败只记
+                # warning，不影响本轮采集结果。见 docs/P3_ALERTS.md。
+                try:
+                    from trend_radar.alerts import send_burst_alerts
+
+                    if cfg.get("telegram", {}).get("enabled", True):
+                        alert_result = send_burst_alerts(bursts)
+                        counts["alerts_sent"] = alert_result["sent"]
+                        counts["alerts_failed"] = len(alert_result["errors"])
+                        if alert_result["errors"]:
+                            logger.warning(
+                                "Telegram 提醒失败 %d 条: %s",
+                                len(alert_result["errors"]),
+                                alert_result["errors"],
+                            )
+                    else:
+                        counts["alerts_sent"] = 0
+                        counts["alerts_failed"] = 0
+                except Exception as exc:  # 提醒失败不影响采集结果
+                    logger.warning("Telegram 提醒异常（不影响采集）: %s", exc)
+                    counts["alerts_sent"] = 0
+                    counts["alerts_failed"] = len(bursts)
         except Exception as exc:  # 聚类/持久化失败不影响采集结果
             logger.warning("事件聚类/持久化失败（不影响采集）: %s", exc)
             counts["events"] = 0
