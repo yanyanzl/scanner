@@ -466,6 +466,14 @@ def _translate_priority_texts(
             except Exception as exc:
                 logger.warning("DeepL 翻译异常（不影响采集）: %s", exc)
             _mark_youtube_run(deepl_state_path)
+        elif deepl_may_run and not deepl_key:
+            # Azure 失败且 DeepL 没配 key：本轮注定不翻译，记一行——
+            # 否则 azure/deepl 双 0 且没有任何说明（2026-11-16 连续
+            # 两轮就是这种情况：deepl_due 里 bool(deepl_key) 为假，
+            # 整个 DeepL 分支被静默跳过）。
+            logger.info("Azure 本轮没翻出东西，DeepL 也没配 key（DEEPL_API_KEY），本轮不翻译")
+        elif deepl_may_run and not deepl_due:
+            logger.info("Azure 本轮没翻出东西，DeepL 本轮还没到时间（每小时最多 1 次），本轮不翻译")
     return azure_count, deepl_count
 
 
@@ -647,13 +655,23 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
         # P2 准备：每轮采集后聚类并持久化事件快照（失败不影响本轮采集）。
         # 只有接在这里，events / event_snapshots 才会随扫描自动积累，
         # 事件才有跨轮次的稳定 ID 与可比的历史，爆发检测才有上一轮可比。
+        # round_now 只算一次，同时传给 persist_events 和 detect_bursts：
+        # 快照的 collected_at 就是本轮的 now，detect_bursts 的
+        # only_fresh 才能认出“本轮新产生的快照”。不传同一个 now，
+        # 两边各自取当前时间、差几秒，容忍窗口（5 分钟）也能兜住，
+        # 但同一个 now 更干净。only_fresh=True 是跨轮次重复触发的
+        # 根治（2026-11-16：09:15 与 09:31 两轮逐字节重复，同一批
+        # event_id 反复报警——陈旧快照的事件不再触发，见 burst.py）。
         try:
             from trend_radar.burst import detect_bursts
             from trend_radar.clustering import cluster_from_db, persist_events
 
+            round_now = datetime.now(timezone.utc)
             events = cluster_from_db(db_path)
-            persist_events(conn, events)
-            bursts = detect_bursts(conn, thresholds=cfg.get("burst"))
+            persist_events(conn, events, now=round_now)
+            bursts = detect_bursts(
+                conn, thresholds=cfg.get("burst"), now=round_now, only_fresh=True
+            )
             # 重复出现：同名事件在窗口内已跨平台出现过（burst 的
             # is_recurrence，见 trend_radar/burst.py）——不发提醒。
             # 排名和翻译仍用完整 bursts 列表：rank_events 会按

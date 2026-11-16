@@ -234,7 +234,17 @@ def azure_translate_many(
             raise AzureUnavailable(f"Azure 翻译失败（HTTP {resp.status_code}）")
         results = _parse_azure_response(resp.json(), batch)
         if not results:
-            logger.warning("Azure 翻译失败（返回里没有可用译文）：本轮改走 DeepL")
+            # 2026-11-16 连续两轮都栽在这里：HTTP 200 但解析不出可用
+            # 译文（返回不是列表、或每条都没 translations[0].text、
+            # 或译文为空/与原文相同，见 _parse_azure_response）。只报
+            # 一句“没有可用译文”没法定位——把状态码和返回体截断（200
+            # 字符，不含 key，返回体是 Azure 的回复、不含请求密钥）
+            # 一起记下来，下次从日志就能看出来。
+            logger.warning(
+                "Azure 翻译失败（HTTP %s，返回里没有可用译文）：本轮改走 DeepL；返回体截断：%s",
+                resp.status_code,
+                resp.text[:200],
+            )
             raise AzureUnavailable("Azure 翻译返回里没有可用译文")
         return results, chars_used, exhausted
     except AzureUnavailable:

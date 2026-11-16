@@ -128,8 +128,9 @@ class TestJsPayload(unittest.TestCase):
         tpl = muse_chat.JS_PAYLOAD_TEMPLATE
         self.assertIn("'send'", tpl)
         self.assertIn("发送", tpl)
-        self.assertIn('button[type="submit"]', tpl)
-        self.assertIn("KeyboardEvent('keydown'", tpl)
+        self.assertIn('input[type="submit"]', tpl)
+        self.assertIn("makeEnterEvent('keydown')", tpl)
+        self.assertIn("new KeyboardEvent(type,", tpl)
         self.assertIn("JSON.stringify({ok: false, reason: 'no_input'})", tpl)
         self.assertIn("return JSON.stringify({ok: true", tpl)
 
@@ -463,6 +464,15 @@ class TestSafariTemplate(unittest.TestCase):
         self.assertNotIn("Google Chrome", tpl)
         self.assertNotIn("execute javascript", tpl)
 
+    def test_template_activates_and_selects_current_tab(self):
+        # 2026-11-16 实测：只有 Muse 页面在前台时发送才成功。Safari 先
+        # activate、把目标标签页设为当前标签页、等 0.5 秒，再跑 JS。
+        tpl = muse_chat.SAFARI_APPLESCRIPT_TEMPLATE
+        self.assertIn("activate", tpl)
+        self.assertIn("set current tab of window", tpl)
+        self.assertIn("current tab of window 1", tpl)
+        self.assertIn("delay 0.5", tpl)
+
 
 class TestSafariSend(unittest.TestCase):
     def _run(self, stdout="", returncode=0, stderr="", side_effect=None):
@@ -576,6 +586,122 @@ class TestSafariCli(unittest.TestCase):
             self.assertEqual(muse_chat.main(["--test", "x", "--method", "safari"]), 0)
         send.assert_called_once()
         self.assertEqual(send.call_args.args[1].get("method"), "safari")
+
+
+class TestSubmitChainHardening(unittest.TestCase):
+    """2026-11-16 Safari 实测：文字填进输入框了，但没发送。提交链加固。"""
+
+    def test_js_uses_exec_command_insert_text(self):
+        tpl = muse_chat.JS_PAYLOAD_TEMPLATE
+        self.assertIn("execCommand('insertText'", tpl)
+
+    def test_js_falls_back_with_beforeinput(self):
+        tpl = muse_chat.JS_PAYLOAD_TEMPLATE
+        self.assertIn("beforeinput", tpl)
+        self.assertIn("inputType: 'insertText'", tpl)
+
+    def test_js_uses_request_submit(self):
+        tpl = muse_chat.JS_PAYLOAD_TEMPLATE
+        self.assertIn("requestSubmit", tpl)
+        self.assertIn("submitted: 'form'", tpl)
+
+    def test_js_enter_event_forces_key_code_13(self):
+        tpl = muse_chat.JS_PAYLOAD_TEMPLATE
+        self.assertIn("Object.defineProperty(ev, 'keyCode', {value: 13})", tpl)
+        self.assertIn("Object.defineProperty(ev, 'which', {value: 13})", tpl)
+
+    def test_find_send_button_matches_submit_words(self):
+        tpl = muse_chat.JS_PAYLOAD_TEMPLATE
+        self.assertIn("indexOf('submit')", tpl)
+        self.assertIn("提交", tpl)
+        self.assertIn("disabled", tpl)
+
+    def test_send_button_prefers_form_then_container(self):
+        # 按钮归属：同一个 form 里的优先，其次是输入框最近容器里的，
+        # 最后才是全页兜底；绝不无条件点任意附近按钮。
+        tpl = muse_chat.JS_PAYLOAD_TEMPLATE
+        self.assertIn("closest('form')", tpl)
+        self.assertIn("parentElement", tpl)
+        self.assertNotIn("if (sib) return sib;", tpl)
+
+    def test_submit_order_button_then_form_then_enter(self):
+        tpl = muse_chat.JS_PAYLOAD_TEMPLATE
+        self.assertLess(tpl.index("found.button.click()"), tpl.index("requestSubmit"))
+        self.assertLess(tpl.index("requestSubmit"), tpl.index("makeEnterEvent('keydown')"))
+
+    def test_cli_reports_form_submission(self):
+        with (
+            mock.patch.object(
+                muse_chat,
+                "send_to_muse_chat",
+                mock.Mock(
+                    return_value={
+                        "ok": True,
+                        "method": "safari",
+                        "detail": {"input": "div", "submitted": "form"},
+                    }
+                ),
+            ),
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertEqual(muse_chat.main(["--test", "hi"]), 0)
+        self.assertIn("form", out.getvalue())
+
+    def test_disabled_button_never_counted_as_success(self):
+        # 灰按钮不点、不算成功；实在没法提交时报 send_button_disabled。
+        tpl = muse_chat.JS_PAYLOAD_TEMPLATE
+        self.assertIn("disabledButton", tpl)
+        self.assertIn("found.button.disabled", tpl)
+        self.assertIn("'send_button_disabled'", tpl)
+        self.assertIn("button: buttonLabel(found.disabledButton)", tpl)
+
+    def test_js_returns_button_label_in_detail(self):
+        # result 的 detail 带按钮关键信息（label），CLI 能打印出来定位。
+        tpl = muse_chat.JS_PAYLOAD_TEMPLATE
+        self.assertIn("function buttonLabel", tpl)
+        self.assertIn("button: buttonLabel(found.button)", tpl)
+
+    def test_cli_prints_button_label_on_success(self):
+        with (
+            mock.patch.object(
+                muse_chat,
+                "send_to_muse_chat",
+                mock.Mock(
+                    return_value={
+                        "ok": True,
+                        "method": "safari",
+                        "detail": {"input": "textarea", "submitted": "button", "button": "发送"},
+                    }
+                ),
+            ),
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertEqual(muse_chat.main(["--test", "hi"]), 0)
+        self.assertIn("发送按钮：发送", out.getvalue())
+
+    def test_cli_reports_send_button_disabled(self):
+        with (
+            mock.patch.object(
+                muse_chat,
+                "send_to_muse_chat",
+                mock.Mock(
+                    return_value={
+                        "ok": False,
+                        "reason": "send_button_disabled",
+                        "detail": "{'button': '发送'}",
+                    }
+                ),
+            ),
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertEqual(muse_chat.main(["--test", "hi"]), 1)
+        self.assertIn("send_button_disabled", out.getvalue())
+
+    def test_log_failure_hint_for_send_button_disabled(self):
+        with mock.patch.object(muse_chat, "logger") as fake_logger:
+            muse_chat._log_send_failure({"reason": "send_button_disabled"})
+        self.assertTrue(fake_logger.warning.called)
+        self.assertIn("disabled", str(fake_logger.warning.call_args[0]))
 
 
 if __name__ == "__main__":

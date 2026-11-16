@@ -30,10 +30,20 @@
 JS 那段是尽力而为（best-effort）：Muse 网页的真实 DOM 没法在
 这台没登录的机器上看，只能按常见输入框形态写多层兜底——
 textarea → contenteditable → input[type=text] → role=textbox，
-填值用原生 setter + input 事件（React 受控输入框才能认到），
-发送先找发送按钮（aria-label/title 含 send/发送、type=submit、
-输入框旁边的按钮），找不到才发回车键事件。找不到输入框时
-什么都不做、返回 ok:false，绝不乱打字。
+填值：TEXTAREA/INPUT 用原生 setter + input 事件（React 受控输入框
+才能认到）；contenteditable 优先 execCommand('insertText')（走编辑器
+自己的处理、同步内部状态），回落 textContent + beforeinput/input
+事件。发送按顺序：可用的发送按钮（和输入框同一个 form 里、或最近
+容器里的优先；aria-label/title/文本含 send/submit/发送/提交，或显
+式 type=submit；灰按钮永远不点）→ 输入框所在表单的 requestSubmit()
+→ 回车键事件（keyCode/which 强制 13；但发送按钮是灰的时不发回车——
+页面认为输入框是空的，合成回车同样会被忽略，报 send_button_disabled）。
+找不到输入框时什么都不做、返回 ok:false，绝不乱打字。2026-11-16
+Safari 实测：CLI 报“已发送”但消息没进对话——JS 点了按钮就报 ok 是
+假阳性（按钮可能是灰的、不是真正的发送按钮、或打进了后台标签页）；
+现在只在真正做了发送动作时报 ok，灰按钮报 send_button_disabled，
+Safari 执行 JS 前先 activate 并把目标标签页设为当前标签页（2026-11-16
+实测：只有页面在前台时发送才成功；activate 会抢焦点，见 docs/MUSE_CHAT.md）。
 
 失败是常态、不是异常：标签页没开、Chrome 没开、权限没给、
 端口没开，都会返回 ok:false 并记一条 INFO/警告，扫描轮次
@@ -168,26 +178,95 @@ JS_PAYLOAD_TEMPLATE = r"""(function (message) {
       var proto = tag === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
       setter.call(el, value);
-    } else {
-      el.textContent = value;
+      el.dispatchEvent(new Event('input', {bubbles: true}));
+      return;
+    }
+    // 富文本编辑器（contenteditable，Lexical/Slate 这类）：只改 textContent
+    // 不动编辑器内部状态，发送按钮会一直 disabled、回车也被忽略。
+    // 优先走 execCommand('insertText')，让编辑器自己的 beforeinput/input
+    // 处理跑起来、内部状态同步；先全选再插，替换掉框里已有的文字。
+    try {
+      var sel = window.getSelection();
+      if (sel) sel.selectAllChildren(el);
+      if (document.execCommand('insertText', false, value)) return;
+    } catch (e) {}
+    el.textContent = value;
+    try {
+      el.dispatchEvent(new InputEvent('beforeinput', {bubbles: true, cancelable: true, inputType: 'insertText', data: value}));
+    } catch (e2) {
+      el.dispatchEvent(new Event('beforeinput', {bubbles: true, cancelable: true}));
     }
     el.dispatchEvent(new Event('input', {bubbles: true}));
   }
-  function findSendButton(input) {
-    var i, b, label;
-    var btns = document.querySelectorAll('button');
+  function buttonLabel(b) {
+    var s = ((b.getAttribute && (b.getAttribute('aria-label') || b.getAttribute('title'))) || b.textContent || '').trim();
+    return s.slice(0, 40);
+  }
+  function isDisabledButton(b) {
+    return !!b && (b.disabled || (b.getAttribute && b.getAttribute('aria-disabled') === 'true'));
+  }
+  function sendLabel(b) {
+    return ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') + ' ' + (b.textContent || '')).toLowerCase();
+  }
+  function labelMatchesSend(b) {
+    var label = sendLabel(b);
+    return label.indexOf('send') !== -1 || label.indexOf('submit') !== -1 || label.indexOf('发送') !== -1 || label.indexOf('提交') !== -1;
+  }
+  function isSendButton(b, labelOnly) {
+    if (!b || isDisabledButton(b)) return false;
+    if (labelMatchesSend(b)) return true;
+    return !labelOnly && !!(b.getAttribute && b.getAttribute('type') === 'submit');
+  }
+  function findSendButtonIn(root, found) {
+    // 在 root 内找可用的发送按钮：先按 label 特征，再按显式 type=submit。
+    // 只找到灰的（disabled）时不返回它，记下来（found.disabled）继续找，
+    // 别处可能有可用的；最后实在没有可用的，调用方凭它报 send_button_disabled。
+    var btns = root.querySelectorAll('button, input[type="submit"]');
+    var i, b;
+    for (i = 0; i < btns.length; i++) {
+      if (isSendButton(btns[i], true)) return btns[i];
+    }
+    for (i = 0; i < btns.length; i++) {
+      if (isSendButton(btns[i], false)) return btns[i];
+    }
     for (i = 0; i < btns.length; i++) {
       b = btns[i];
-      label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '') + ' ' + (b.textContent || '')).toLowerCase();
-      if (label.indexOf('send') !== -1 || label.indexOf('发送') !== -1) return b;
-    }
-    var submit = document.querySelector('button[type="submit"], input[type="submit"]');
-    if (submit) return submit;
-    if (input && input.parentElement) {
-      var sib = input.parentElement.querySelector('button');
-      if (sib) return sib;
+      if (!found.disabled && isDisabledButton(b) && (labelMatchesSend(b) || (b.getAttribute && b.getAttribute('type') === 'submit'))) found.disabled = b;
     }
     return null;
+  }
+  function findSendButton(input) {
+    // 归属优先：同一个 form 里的 > 输入框最近容器里的 > 全页的。
+    // 只凭全页第一个带 send 字样的按钮就点，很容易点到别的按钮。
+    // 返回 {button: 可用的发送按钮或 null, disabledButton: 找到的
+    // 灰色发送按钮或 null}；灰按钮永远不点。
+    var found = {disabled: null};
+    var form = input.closest ? input.closest('form') : null;
+    var btn = null;
+    if (form) {
+      btn = findSendButtonIn(form, found);
+      if (btn) return {button: btn, disabledButton: found.disabled};
+    }
+    var node = input.parentElement;
+    var depth = 0;
+    while (node && depth < 5) {
+      btn = findSendButtonIn(node, found);
+      if (btn) return {button: btn, disabledButton: found.disabled};
+      node = node.parentElement;
+      depth++;
+    }
+    btn = findSendButtonIn(document, found);
+    return {button: btn, disabledButton: found.disabled};
+  }
+  function makeEnterEvent(type) {
+    var ev = new KeyboardEvent(type, {key: 'Enter', code: 'Enter', bubbles: true, cancelable: true, composed: true});
+    // keyCode/which 不在 KeyboardEventInit 里，构造函数里给也不生效，
+    // 直接在事件对象上强制写 13（有些处理函数只认 keyCode）。
+    try {
+      Object.defineProperty(ev, 'keyCode', {value: 13});
+      Object.defineProperty(ev, 'which', {value: 13});
+    } catch (e) {}
+    return ev;
   }
   var input = findInput();
   if (!input) return JSON.stringify({ok: false, reason: 'no_input'});
@@ -196,15 +275,41 @@ JS_PAYLOAD_TEMPLATE = r"""(function (message) {
   } catch (e) {
     return JSON.stringify({ok: false, reason: 'set_value_failed', error: String(e)});
   }
-  var btn = findSendButton(input);
-  if (btn) {
-    btn.click();
-    return JSON.stringify({ok: true, input: input.tagName.toLowerCase(), submitted: 'button'});
+  var found = findSendButton(input);
+  var form = input.closest ? input.closest('form') : null;
+  if (found.button) {
+    // 点之前再确认一次：灰按钮 click() 是空操作，点了也白点，
+    // 还会谎报 ok:true（2026-11-16 Safari 实测的假阳性就是这么来的）。
+    if (!found.button.disabled) {
+      found.button.click();
+      return JSON.stringify({ok: true, input: input.tagName.toLowerCase(), submitted: 'button', button: buttonLabel(found.button)});
+    }
   }
-  var opts = {key: 'Enter', code: 'Enter', bubbles: true, cancelable: true};
-  input.dispatchEvent(new KeyboardEvent('keydown', opts));
-  input.dispatchEvent(new KeyboardEvent('keypress', opts));
-  input.dispatchEvent(new KeyboardEvent('keyup', opts));
+  if (form) {
+    try {
+      if (form.requestSubmit) {
+        form.requestSubmit();
+      } else {
+        form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+      }
+      var out = {ok: true, input: input.tagName.toLowerCase(), submitted: 'form'};
+      if (found.disabledButton) {
+        out.button = buttonLabel(found.disabledButton);
+        out.buttonDisabled = true;
+      }
+      return JSON.stringify(out);
+    } catch (e) {
+      // requestSubmit 失败就继续走回车
+    }
+  }
+  if (found.disabledButton) {
+    // 发送按钮是灰的：页面认为输入框是空的（值没进编辑器状态），
+    // 合成回车同样会被忽略——报 ok:false，别谎报已发送。
+    return JSON.stringify({ok: false, reason: 'send_button_disabled', button: buttonLabel(found.disabledButton)});
+  }
+  input.dispatchEvent(makeEnterEvent('keydown'));
+  input.dispatchEvent(makeEnterEvent('keypress'));
+  input.dispatchEvent(makeEnterEvent('keyup'));
   return JSON.stringify({ok: true, input: input.tagName.toLowerCase(), submitted: 'enter'});
 })(__MESSAGE_JSON__)"""
 
@@ -258,10 +363,32 @@ SAFARI_APPLESCRIPT_TEMPLATE = """on run argv
     return "NO_SAFARI"
   end if
   tell application "Safari"
+    -- 先把 Safari 带到前台（2026-11-16 实测：只有 Muse 页面在前台
+    -- 被看着时发送才成功，后台标签页里点了按钮也发不出去；
+    -- 09:15/09:31 两轮 muse_chat_sent: 3 全是假阳性）。activate 会
+    -- 抢焦点，每 15 分钟把 Safari 弹到前台，见 docs/MUSE_CHAT.md。
+    -- 失败不崩：前面已判过 NO_SAFARI，这里再包一层 try，失败就
+    -- 继续往下找标签页。
+    try
+      activate
+    end try
+    -- 优先用最前面窗口的当前标签页（用户正在看的那个对话）：
+    -- Safari 里开了多个 Muse 标签页时，顺序扫描可能打进后台的
+    -- 标签页。切到目标标签页、等 0.5 秒让它成为活动标签页，再跑 JS。
+    try
+      set curTab to current tab of window 1
+      if (URL of curTab) contains urlMatch then
+        set current tab of window 1 to curTab
+        delay 0.5
+        return do JavaScript jsCode in curTab
+      end if
+    end try
     -- 同样用显式序号定位标签页（与 Chrome 模板同理）。
     repeat with wi from 1 to count of windows
       repeat with ti from 1 to count of tabs of window wi
         if (URL of tab ti of window wi) contains urlMatch then
+          set current tab of window wi to tab ti of window wi
+          delay 0.5
           return do JavaScript jsCode in tab ti of window wi
         end if
       end repeat
@@ -517,6 +644,7 @@ def _log_send_failure(result: dict, method: str | None = None) -> None:
         "safari_js_blocked": "Safari 未开启 Apple Events 的 JavaScript：Safari → 设置 → 高级 → 勾选“在菜单栏中显示开发菜单”，然后菜单栏 Develop（开发）→ 勾选 Allow JavaScript from Apple Events（见 docs/MUSE_CHAT.md）",
         "cdp_unreachable": "连不上 Chrome 调试端口：请完全退出 Chrome 后加 --remote-debugging-port=9222 重开（见 docs/MUSE_CHAT.md）",
         "websocket_client_missing": "缺少 websocket-client：运行 pip install -r requirements.txt（或重跑安装脚本）",
+        "send_button_disabled": "发送按钮是灰的（disabled）：页面认为输入框是空的——值可能没进编辑器状态，合成回车同样发不出去；看 --test 打印的输入框类型和按钮信息再定位（见 docs/MUSE_CHAT.md）",
         "unsupported_platform": "当前平台不支持浏览器输入（仅 macOS / Windows）",
     }
     hint = hints.get(reason)
@@ -634,6 +762,9 @@ def main(argv: list[str] | None = None) -> int:
     if result.get("ok"):
         detail = result.get("detail") or {}
         print(f"标签页：已找到；输入框：已找到（{detail.get('input', '?')}），已通过 {detail.get('submitted', '?')} 发送")
+        if detail.get("button"):
+            suffix = "（disabled，本次没点它）" if detail.get("buttonDisabled") else ""
+            print(f"发送按钮：{detail['button']}{suffix}")
         print("结果：已发送")
         return 0
     print(f"结果：未发送（{result.get('reason', 'unknown')}）")

@@ -246,6 +246,33 @@ class TestAzureTranslateMany(unittest.TestCase):
             with self.assertRaises(translate_mod.AzureUnavailable):
                 translate_mod.azure_translate_many(["Hello"], AZURE_KEY)
 
+    def test_no_usable_translations_warning_carries_status_and_body(self):
+        """2026-11-16 连续两轮栽在这里：HTTP 200 但解析不出可用译文
+        （译文与原文相同，被 _parse_azure_response 跳过）。warning
+        必须带状态码和返回体截断，否则下次还是没法定位；key 绝不进日志。"""
+        body = '{"weird": "body-marker-123"}'
+        resp = _FakeResp(
+            status_code=200,
+            json_data=[{"translations": [{"text": "Hello", "to": "zh-Hans"}]}],
+            text=body,
+        )
+        capture = _LogCapture()
+        logger = logging.getLogger("trend_radar.translate")
+        logger.addHandler(capture)
+        logger.setLevel(logging.WARNING)
+        try:
+            with mock.patch.object(
+                translate_mod.requests, "post", mock.Mock(return_value=resp)
+            ):
+                with self.assertRaises(translate_mod.AzureUnavailable):
+                    translate_mod.azure_translate_many(["Hello"], AZURE_KEY)
+        finally:
+            logger.removeHandler(capture)
+        joined = "\n".join(capture.messages)
+        self.assertIn("200", joined)
+        self.assertIn("body-marker-123", joined)
+        self.assertNotIn(AZURE_KEY, joined)
+
     def test_char_budget_trims_batch_never_over_budget(self):
         """max_chars 参数截断批次：超出的文本不发，只发预算内的。"""
         texts = ["a" * 500, "b" * 500, "c" * 500]  # 1500 字符 > 1200

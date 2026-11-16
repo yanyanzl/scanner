@@ -96,28 +96,37 @@ CLI：`python -m trend_radar.burst --db data/trends.sqlite3 [--json]`。
 | --- | --- | --- |
 | `growth_spike` | max_growth 翻倍以上，且绝对增量达标 | ×2.0，增量 ≥ 100/小时 |
 | `score_surge` | total_score 翻倍以上，且绝对增量达标 | ×2.0，增量 ≥ 5.0 |
-| `new_multi_platform` | 只有一条快照（首次出现），且已跨 ≥ N 个平台；且条数 ≥ 10 或总分 ≥ 5.0（最低质量门槛，见下） | N = 2 |
+| `new_multi_platform` | 只有一条快照（首次出现），且已跨 ≥ N 个平台；且条数 ≥ 20 或总分 ≥ 5.0（最低质量门槛，见下） | N = 2 |
 
-**最低质量门槛（2026-11-15，只用于 `new_multi_platform`）：** 刚出现就
+**最低质量门槛（2026-11-15，只用于 `new_multi_platform`；2026-11-16 条数腿 10 → 20）：** 刚出现就
 跨平台本身是信号，但 7 条内容、总分 1.88 的 YouTube Shorts（小丑
 cosplay，2026-11-15 实测）也能凑出 2 个平台——它拿了爆发加分、发了
 提醒、还冲到 Top 10 第 2 名。所以规则 (c) 再加一条：最新快照的
-`item_count >= alert_min_items`（默认 10）**或** `total_score >=
+`item_count >= alert_min_items`（默认 20）**或** `total_score >=
 alert_min_total_score`（默认 5.0），满足其一才算爆发；两个都不满足
 时不产生 burst、不发提醒、Top 10 里没有爆发加分、Dashboard“正在爆发”
 一节里也没有它。`growth_spike` / `score_surge` 自带绝对增量门槛
 （翻倍 + 增量 ≥ 100/小时 / ≥ 5.0），不受这条影响。阈值是初始假设，
-未校准，在 `config.yaml` 的 `burst:` 一节里改。
+未校准，在 `config.yaml` 的 `burst:` 一节里改。为什么是 20 不是
+AND：条数少但总分高的小而真事件（例如 5 条、8.0 分）要能靠总分腿
+照常报，AND 会把它拦住；2026-11-16 生产实测里小丑是 11 条/2.94 分
+（靠旧 10 条门槛漏过去了），真新闻是 146 条/45.95 分，20 落在两者
+之间。门槛只管首次出现（规则 c），长起来后增长/总分跃升照常触发。
 
-**重复出现（2026-11-15）：** 每小时直播这种标题（马拉雅拉姆语小时
+**重复出现（2026-11-15；2026-11-16 加固）：** 每小时直播这种标题（马拉雅拉姆语小时
 直播，2026-11-15 实测）每小时换一个新事件 id、每次都拿爆发加分、
 天天霸榜。`detect_bursts` 给每个 `new_multi_platform` burst 打
 `is_recurrence` 标记：库里已有一个更早的同名多平台事件时为真——
-更早 = `first_seen` 严格早于本事件、且落在最近
-`recurrence_window_hours` 小时（默认 24）内；同名 = 原名归一化后
-相同（小写、空白折叠）；多平台 = 那个事件最新快照的
-`platform_count >= 2`。判断函数是 `trend_radar/burst.py::is_recurrence`
-（collector 和 Dashboard Top 10 共用这一个入口，不各自再查库）。
+更早 = `first_seen` 严格早于本事件；同名 = 剥掉日期片段后归一化
+相同（DD.MM.YYYY、YYYY-MM-DD、DD/MM/YYYY、“M月D日”——2026-11-16
+生产实测：直播标题每天换日期，15.11.2026 → 16.11.2026，不剥就
+永远匹配不上；非日期的数字保留，iPhone 17 与 iPhone 16 仍是两个
+故事）；“出现过”按那个事件最近一次快照算，不按 `first_seen`——
+2026-11-16 查实：旧门槛按 `first_seen` 算窗口，老事件首次出现
+超过 24 小时后即使昨晚还有快照也会漏过去（小丑就是这样又报了一次）；
+多平台 = 那个事件最新快照的 `platform_count >= 2`。判断函数是
+`trend_radar/burst.py::is_recurrence`（collector 和 Dashboard Top 10
+共用这一个入口，不各自再查库）。
 重复出现的效果：(a) collector 不发 Telegram 提醒（记一条
 “重复出现 … 个，不发提醒”日志，round 汇总里 `bursts_recurrence`
 单独计数）；(b) Top 10 排名里爆发分量记 0、新鲜度分量记 0、原因里
@@ -128,6 +137,27 @@ alert_min_total_score`（默认 5.0），满足其一才算爆发；两个都不
 也会被压住；窗口就是调这个的旋钮。`growth_spike` / `score_surge`
 是老事件的变化信号，不按重复出现处理。
 
+**跨轮次重复触发（2026-11-16，霸屏的主因，门槛和日期是次因）：**
+09:15 与 09:31 两轮逐字节重复——同样的 11 个爆发、同样的 3 条发出、
+event_id 完全相同。根因：`detect_bursts` 读库里所有事件，一条快照的
+事件只要过门槛就触发 `new_multi_platform`，不管那条快照是哪一轮的；
+聚类不稳定时，事件某轮不再出现在聚类输出里就永远只有一条快照，于是
+每轮都重新触发。`is_recurrence` 要求一个不同 event_id 的老事件，
+永远拦不住原事件本身，只能拦住后来出现的同名双胞胎。修法：
+`detect_bursts(..., only_fresh=True)` 时，只有最新快照是本轮新产生
+的事件才参与检测（最新快照的 `collected_at` 与本轮 `now` 的差在
+`FRESH_SNAPSHOT_TOLERANCE`（5 分钟）内）；快照陈旧的事件本轮没有
+新证据，直接跳过——三条规则都适用（陈旧的 `growth_spike` /
+`score_surge` 也不再重复触发）。采集器（collector）每轮算一个
+`round_now` 同时传给 `persist_events` 和 `detect_bursts`，并传
+`only_fresh=True`；面板/独立调用不传，默认 `False`、保持原行为
+（面板打开时看的是最近一轮的爆发，不按轮次过滤）。保证：
+同一事件的 `new_multi_platform` 只触发一次（首个快照只在创建那轮
+是新鲜的）；新事件第一次跨平台仍能正常提醒；已抑制的 recurrence
+行为不变。持续获得新快照且持续翻倍的真实事件仍会再次提醒（那是
+新证据，不是重复）——如需连这个也只提醒一次，再加持久化
+(event_id, rule) 提醒记录（本次没做）。
+
 阈值在 `config.yaml` 的 `burst:` 一节里：
 
 ```yaml
@@ -137,7 +167,7 @@ burst:
   score_multiplier: 2.0
   score_min_delta: 5.0
   new_event_min_platforms: 2
-  alert_min_items: 10
+  alert_min_items: 20
   alert_min_total_score: 5.0
   recurrence_window_hours: 24
 ```
@@ -161,9 +191,12 @@ burst:
   快照各追加一行；`cluster_from_db` 的结果带稳定 event_id。
 - `tests/test_burst.py`：增长尖峰、总分跃升、新事件跨平台
   均被检出；平坦历史、单快照单平台、小基数增长均不触发；另有
-  最低质量门槛测试（7 条/1.88 分不触发，10 条或 5.0 分触发，
+  最低质量门槛测试（11 条/2.94 分不触发，20 条或 5.0 分触发，
   边界与自定义阈值）与重复出现测试（同名 1 小时后出现判重复、
   25 小时后/改名/早先单平台不判重复、窗口关闭不判重复、
+  日期剥离：14.11.2026 → 15.11.2026、中文 11月14日 → 11月15日
+  判重复、iPhone 17/16 不判重复、老事件 first_seen 超窗但最近
+  快照在窗内仍判重复、日期重复进排名丢爆发分 + 新鲜度分、
   growth_spike / score_surge 不受门槛影响）。
 - `tests/test_collector_events.py`（1 个）：`collect_once` 不跑任何
   adapter 时，已入库内容仍被聚类持久化；第二轮同一 event_id、
