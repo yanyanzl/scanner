@@ -14,6 +14,8 @@ import os
 
 import requests
 
+from trend_radar.timefmt import format_local_time
+
 logger = logging.getLogger(__name__)
 
 API_BASE = "https://api.telegram.org"
@@ -42,6 +44,13 @@ def format_burst_message(burst: dict) -> str:
         f"事件：{display_name}",
         f"原因：{'、'.join(reasons) if reasons else '爆发'}",
     ]
+    # 人类可读的时间行（2026-11-16 第二批改进）：burst 的 detected_at
+    #（UTC）转本机当地时间；标记第一行的 ts 不动。detected_at 缺失或
+    # 解析失败时不写这一行。Telegram 和 Muse 对话共用这份正文，两边
+    # 都有这一行。
+    detected_local = format_local_time(burst.get("detected_at"))
+    if detected_local:
+        lines.append(f"时间：{detected_local}（伦敦时间）")
     platforms = (current.get("platforms") or "").strip()
     if platforms:
         lines.append(f"平台：{platforms}（{current.get('platform_count', 0)} 个）")

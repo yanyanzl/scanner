@@ -16,6 +16,13 @@ from trend_radar.dashboard_data import (
     load_items,
     load_top_events,
 )
+from trend_radar.dashboard_rows import (
+    burst_row,
+    cross_platform_row,
+    fastest_item_row,
+    hot_item_row,
+    top_event_row,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "trends.sqlite3"
@@ -48,19 +55,7 @@ if not top_events:
     st.info("暂无最热事件：需要先跑一轮采集并聚出事件。")
 else:
     st.dataframe(
-        [
-            {
-                "排名": i + 1,
-                "事件": ev.get("name", ""),
-                "综合分": round(float(ev.get("rank_score") or 0), 1),
-                "平台数": ev.get("platform_count", 0),
-                "平台": ", ".join(ev.get("platforms", [])),
-                "最大增长/小时": ev.get("max_growth", 0),
-                "原因": " · ".join(ev.get("rank_reasons") or []),
-                "链接": ev.get("link_url") or None,
-            }
-            for i, ev in enumerate(top_events)
-        ],
+        [top_event_row(ev, i + 1) for i, ev in enumerate(top_events)],
         column_config={
             # “查看”是可点链接（LinkColumn）；没有 URL 的事件该格为空，
             # 事件名仍是纯文本，不给死链接。
@@ -72,22 +67,13 @@ else:
         "综合分 0-100：增长 30%、成员强度 20%、爆发 20%、跨平台 20%、"
         "新鲜度 10%（半衰期 24 小时），分量在本批事件内相对归一化。"
         "权重是初始假设，需用真实数据校准，见 docs/TOP_EVENTS.md。"
+        "时间列（首次出现、发布时间、检测时间）均为本机当地时间，"
+        "格式 MM-DD HH:MM。"
     )
 
 st.subheader("🔥 实时热点榜（按综合热度分数排序，前 100 条）")
 st.dataframe(
-    [
-        {
-            "标题": it.get("title", ""),
-            "平台": it.get("platform", ""),
-            "分数": it.get("score", 0),
-            "增长/小时": it.get("growth", 0),
-            "加速度": it.get("acceleration", 0),
-            "年龄(小时)": it.get("age_hours", 0),
-            "链接": it.get("url", ""),
-        }
-        for it in items
-    ],
+    [hot_item_row(it) for it in items],
     width="stretch",
 )
 
@@ -100,16 +86,7 @@ if not fastest or max(float(it.get("growth") or 0) for it in fastest) <= 0:
     )
 else:
     st.dataframe(
-        [
-            {
-                "标题": it.get("title", ""),
-                "平台": it.get("platform", ""),
-                "增长/小时": it.get("growth", 0),
-                "分数": it.get("score", 0),
-                "链接": it.get("url", ""),
-            }
-            for it in fastest
-        ],
+        [fastest_item_row(it) for it in fastest],
         width="stretch",
     )
 
@@ -147,21 +124,7 @@ if not events:
     st.info("暂无事件：窗口内没有可聚类的内容，或数据库为空。")
 else:
     st.dataframe(
-        [
-            {
-                "事件": ev.get("name_zh") or ev.get("name", ""),
-                "综合分": ev.get("rank_score", "—"),
-                "平台数": ev.get("platform_count", 0),
-                "平台": ", ".join(ev.get("platforms", [])),
-                "条数": ev.get("item_count", 0),
-                "总分": ev.get("total_score", 0),
-                "最高分": ev.get("max_score", 0),
-                "最大增长/小时": ev.get("max_growth", 0),
-                "趋势": ev.get("trend", ""),
-                "首次出现": ev.get("first_seen", ""),
-            }
-            for ev in events[:10]
-        ],
+        [cross_platform_row(ev) for ev in events[:10]],
         width="stretch",
     )
 
@@ -177,16 +140,6 @@ if not bursts:
     )
 else:
     st.dataframe(
-        [
-            {
-                "事件": b.get("name", ""),
-                "爆发原因": ", ".join(b.get("reasons", [])),
-                "增长/小时": f"{b['previous']['max_growth'] if b.get('previous') else '—'} → {b['current']['max_growth']}",
-                "总分": f"{b['previous']['total_score'] if b.get('previous') else '—'} → {b['current']['total_score']}",
-                "平台数": b["current"]["platform_count"],
-                "事件 ID": b.get("event_id", ""),
-            }
-            for b in bursts
-        ],
+        [burst_row(b) for b in bursts],
         width="stretch",
     )

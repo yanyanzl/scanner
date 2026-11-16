@@ -82,6 +82,41 @@ class TestFormatBurstMessage(unittest.TestCase):
         self.assertLessEqual(len(format_burst_message(burst)), 500)
 
 
+class TestFormatBurstMessageTime(unittest.TestCase):
+    """提醒正文里的人类可读时间行（2026-11-16 第二批改进）。
+
+    标记第一行不动；时间行取 burst 的 detected_at（UTC），用
+    timefmt 转本机当地时间。精确值由 helper 的测试覆盖，这里用
+    mock 锁定“传了 detected_at、行存在、位置在原因行之后”。
+    """
+
+    def test_time_line_present(self):
+        with mock.patch(
+            "trend_radar.alerts.format_local_time", return_value="11-15 21:18"
+        ) as fmt:
+            text = format_burst_message(_burst())
+        fmt.assert_called_once_with("2026-11-15T13:18:00+00:00")
+        self.assertIn("时间：11-15 21:18（伦敦时间）", text)
+        lines = text.splitlines()
+        self.assertLess(
+            lines.index("原因：增速突增、总分跃升"),
+            lines.index("时间：11-15 21:18（伦敦时间）"),
+        )
+
+    def test_time_line_real_format(self):
+        # 不 mock：只断言形状，系统本地时区是什么都成立。
+        text = format_burst_message(_burst())
+        self.assertRegex(text, r"时间：\d{2}-\d{2} \d{2}:\d{2}（伦敦时间）")
+
+    def test_no_time_line_when_detected_at_missing(self):
+        burst = _burst()
+        del burst["detected_at"]
+        self.assertNotIn("时间：", format_burst_message(burst))
+        burst2 = _burst()
+        burst2["detected_at"] = "not a date"
+        self.assertNotIn("时间：", format_burst_message(burst2))
+
+
 class TestSendBurstAlerts(unittest.TestCase):
     def setUp(self):
         self.capture = _LogCapture()

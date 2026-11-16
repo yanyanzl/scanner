@@ -5,7 +5,8 @@
 Cheese 收到后分析并优化。简报只做摘要，不做决策——优化动作仍由
 Cheese 在对话里做（或经用户确认后做）。
 
-内容（紧凑，约 1000 字符以内）：日期；Top 5 事件（当前综合排名）；
+内容（紧凑，约 1000 字符以内）：日期；生成时间（发送当时的本机
+当地时间，与报告期日期不同）；Top 5 事件（当前综合排名）；
 昨日计数（事件数、爆发数、被抑制的重复出现数、Telegram 已发、
 Muse 已发/失败）；质量信号（Top 10 里单平台事件数、hashtag 占比
 高的事件数、recurrence 事件数）。
@@ -28,6 +29,8 @@ import logging
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from trend_radar.timefmt import format_local_time
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +204,10 @@ def gather_digest_data(db_path: str | Path, date: str | None = None) -> dict:
         "top_events": top_events,
         "counts": counts,
         "events_count": events_count,
+        # 生成时间：汇总当时的本机当地时间（ISO，带本地时区偏移）。
+        # 与报告期日期（date，昨天）是两回事：date 是“报哪天”，
+        # generated_at 是“这份简报什么时候生成的”。
+        "generated_at": datetime.now().astimezone().isoformat(),
     }
 
 
@@ -219,6 +226,8 @@ def format_quality_digest(data: dict) -> str:
     条（当前综合排名）；质量信号对整个 Top 10 列表算（单平台数、
     hashtag 占比 >= 0.5 的事件数、recurrence 事件数）。计数缺失时
     写“昨日无轮次记录”，Top 10 为空时质量信号写“暂无数据”。
+    data 里有 generated_at 时在标题行后加一行生成时间（本机当地
+    时间，见 gather_digest_data）；没有时不写这一行。
     """
     date = data.get("date") or ""
     top_events = list(data.get("top_events") or [])
@@ -227,8 +236,14 @@ def format_quality_digest(data: dict) -> str:
     lines = [
         f"【质量简报｜quality-digest {DIGEST_MARKER_VERSION}｜date={date}】",
         f"📋 每日质量简报（{date}）",
-        "Top 5（当前综合排名）：",
     ]
+    # 生成时间行（2026-11-16 第二批改进）：发送当时的本机当地时间，
+    # 与报告期日期（date）不同，两行都保留。data 里没有 generated_at
+    # 时不写这一行（不造假时间）。
+    generated_local = format_local_time(data.get("generated_at"))
+    if generated_local:
+        lines.append(f"生成时间：{generated_local}（伦敦时间）")
+    lines.append("Top 5（当前综合排名）：")
     if not shown:
         lines.append("暂无事件")
     for i, ev in enumerate(shown, 1):

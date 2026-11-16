@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -129,6 +130,34 @@ class TestFormatDigest(unittest.TestCase):
         text = format_quality_digest(data)
         self.assertIn("…", text)
 
+    def test_generated_time_line(self):
+        # 生成时间行：gather_digest_data 写进 data 的 generated_at
+        #（发送当时的本机当地时间），与报告期日期是两回事，两行都保留。
+        data = _digest_data()
+        data["generated_at"] = "2026-11-16T08:00:00+08:00"
+        with mock.patch(
+            "trend_radar.quality_digest.format_local_time",
+            return_value="11-16 08:00",
+        ) as fmt:
+            text = format_quality_digest(data)
+        fmt.assert_called_once_with("2026-11-16T08:00:00+08:00")
+        self.assertIn("生成时间：11-16 08:00（伦敦时间）", text)
+        lines = text.splitlines()
+        # 标记行、标题行之后，Top 5 之前。
+        self.assertEqual(lines[2], "生成时间：11-16 08:00（伦敦时间）")
+        self.assertIn("每日质量简报（2026-11-15）", text)  # 报告期日期还在
+        self.assertLessEqual(len(text), 1000)
+
+    def test_generated_time_real_format(self):
+        data = _digest_data()
+        data["generated_at"] = "2026-11-16T08:00:00+08:00"
+        text = format_quality_digest(data)
+        self.assertRegex(text, r"生成时间：\d{2}-\d{2} \d{2}:\d{2}（伦敦时间）")
+
+    def test_no_generated_time_when_missing(self):
+        # data 里没有 generated_at 时不写这一行（不造假时间）。
+        self.assertNotIn("生成时间", format_quality_digest(_digest_data()))
+
 
 class TestDigestConfig(unittest.TestCase):
     def test_defaults(self):
@@ -214,6 +243,16 @@ class TestGatherDigestData(unittest.TestCase):
             # 应为 0（gather 不直接读 events 表，计数来自聚类输出）。
             data = gather_digest_data(db_path, date=yesterday)
             self.assertEqual(data["events_count"], 0)
+
+    def test_gather_adds_generated_at(self):
+        # 简报的生成时间（发送当时的本机当地时间）由 gather 写进 data，
+        # 格式化时只读这个字段，不在纯函数里取当前时间。
+        from trend_radar.scoring import parse_dt
+
+        with tempfile.TemporaryDirectory() as d:
+            data = gather_digest_data(Path(d) / "nope.sqlite3", date="2026-11-15")
+            self.assertIn("generated_at", data)
+            self.assertIsNotNone(parse_dt(data["generated_at"]))
 
 
 class TestSendDigest(unittest.TestCase):

@@ -238,3 +238,9 @@ send/submit/发送/提交，或显式 type=submit；**灰按钮永远不点**）
   端口连不上，每轮只记一条提示，不会弹窗打扰。
 - 提醒正文与 Telegram 同文，但不截到 500 字（对话输入框没这个限制）；
   首行标记另算，不占正文字数。
+- 提醒正文里有一行人类可读的时间（2026-11-16 第二批改进）：
+  `时间：11-16 21:54（伦敦时间）`，取 burst 的 `detected_at`（UTC）
+  转本机当地时间（见 `trend_radar/timefmt.py`）；`detected_at` 缺失
+  时不写这一行。**首行标记一个字符都没动**（`ts` 仍是 UTC ISO，
+  `MARKER_VERSION` 仍是 v1，`parse_scanner_marker` 不变）；时间行
+  只在正文里，Telegram 收到的同一份提醒也有这一行。

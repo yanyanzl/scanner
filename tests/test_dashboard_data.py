@@ -102,6 +102,23 @@ class TestLoadItems(unittest.TestCase):
         fastest = load_fastest(self.db_path)
         self.assertEqual(fastest[0]["title"], "High score")
 
+    def test_items_carry_time_fields(self):
+        # 面板的时间列（发布时间）直接读这两个原始字段，不再拼 SQL。
+        by_title = {it["title"]: it for it in load_items(self.db_path)}
+        self.assertEqual(
+            by_title["High score"]["published_at"], "2026-11-15T06:00:00+00:00"
+        )
+        self.assertEqual(
+            by_title["High score"]["first_seen"], "2026-11-15T07:00:00+00:00"
+        )
+
+    def test_fastest_carries_time_fields(self):
+        fastest = load_fastest(self.db_path)
+        self.assertEqual(
+            fastest[0]["published_at"], "2026-11-15T06:00:00+00:00"
+        )
+        self.assertEqual(fastest[0]["first_seen"], "2026-11-15T07:00:00+00:00")
+
 
 class TestLoadItemsRecurrence(unittest.TestCase):
     """实时热点榜去掉定时重复播报（任务 3）。
@@ -251,6 +268,31 @@ class TestLoadBursts(unittest.TestCase):
             self.assertEqual(bursts[0]["event_id"], "evt_test")
             self.assertIn("growth_spike", bursts[0]["reasons"])
             self.assertIn("score_surge", bursts[0]["reasons"])
+            # 面板的“检测时间”列直接读这个原始字段。
+            self.assertTrue(bursts[0].get("detected_at"))
+
+
+class TestLoadTopEventsTimeFields(unittest.TestCase):
+    """Top 10 的“首次出现”列直接读事件的 first_seen（聚类输出自带，
+    rank_events 是浅拷贝，不丢字段）。"""
+
+    def test_top_events_carry_first_seen(self):
+        from trend_radar.dashboard_data import load_top_events
+
+        with tempfile.TemporaryDirectory() as d:
+            db_path = Path(d) / "trends.sqlite3"
+            conn = dbmod.connect(db_path)
+            _seed(
+                conn,
+                [
+                    (_item("youtube", "Test Event Alpha News", "https://example.com/a"), 9.0),
+                    (_item("rss", "Test Event Beta News", "https://example.com/b"), 8.0),
+                ],
+            )
+            conn.close()
+            top = load_top_events(db_path)
+            self.assertGreaterEqual(len(top), 1)
+            self.assertEqual(top[0].get("first_seen"), "2026-11-15T07:00:00+00:00")
 
 
 if __name__ == "__main__":
