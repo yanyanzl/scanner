@@ -39,23 +39,78 @@ def _display_row(row: dict) -> dict:
     return row
 
 
-def load_items(db_path: str | Path, platform: str = "全部", limit: int = DEFAULT_LIMIT) -> list[dict]:
-    """按分数取 items；platform != "全部" 时只取该平台。缺 DB 返回 []。"""
+def _recurrence_member_urls(db_path: str | Path, conn: sqlite3.Connection) -> set[str]:
+    """当前聚类事件里、属于 recurrence 事件的成员 URL。
+
+    定时重复播报（每小时直播、2PM 头条）每期都是新视频、新 URL，
+    但标题（去掉日期后）与之前出现过的事件相同——按 burst.py 的
+    is_recurrence 判断（同名事件在窗口内已跨平台出现过），这类
+    事件的成员从实时热点榜里排除。判断只看标题与历史，不硬编码
+    标题黑名单。任何一步失败返回空集（不过滤，不影响榜单）。
+    """
+    try:
+        from trend_radar.burst import is_recurrence, load_burst_config
+        from trend_radar.clustering import cluster_from_db
+
+        window = float((load_burst_config() or {}).get("recurrence_window_hours", 24) or 24)
+        events = cluster_from_db(db_path, hours=24)
+    except Exception:
+        return set()
+    urls: set[str] = set()
+    for ev in events:
+        try:
+            if not is_recurrence(
+                conn,
+                ev.get("event_id") or "",
+                ev.get("name"),
+                ev.get("first_seen"),
+                window_hours=window,
+            ):
+                continue
+        except Exception:
+            continue
+        for it in ev.get("items") or []:
+            url = (it.get("url") or "").strip()
+            if url:
+                urls.add(url)
+    return urls
+
+
+def load_items(
+    db_path: str | Path,
+    platform: str = "全部",
+    limit: int = DEFAULT_LIMIT,
+    exclude_recurrence: bool = False,
+) -> list[dict]:
+    """按分数取 items；platform != "全部" 时只取该平台。缺 DB 返回 []。
+
+    exclude_recurrence=True 时，去掉属于 recurrence 事件的成员
+    （定时重复播报：标题去掉日期后与之前出现过的事件相同，见
+    _recurrence_member_urls）。被去掉的条目仍在库里，只是不出现在
+    这份榜单里；其他视图（Top 10、最快增长、爆发）不受影响。
+    为补足被去掉的名额，多取 50 条再截断到 limit（榜单仍尽量满）。
+    """
     conn = _connect(db_path)
     if conn is None:
         return []
     try:
+        fetch_limit = int(limit) + 50 if exclude_recurrence else int(limit)
         if platform == "全部":
             rows = conn.execute(
                 "SELECT * FROM items ORDER BY score DESC, growth DESC LIMIT ?",
-                (int(limit),),
+                (fetch_limit,),
             ).fetchall()
         else:
             rows = conn.execute(
                 "SELECT * FROM items WHERE platform = ? ORDER BY score DESC, growth DESC LIMIT ?",
-                (platform, int(limit)),
+                (platform, fetch_limit),
             ).fetchall()
-        return [_display_row(dict(r)) for r in rows]
+        items = [_display_row(dict(r)) for r in rows]
+        if exclude_recurrence:
+            recurrence_urls = _recurrence_member_urls(db_path, conn)
+            if recurrence_urls:
+                items = [it for it in items if (it.get("url") or "").strip() not in recurrence_urls]
+        return items[: max(1, int(limit))]
     except sqlite3.Error:
         return []
     finally:
@@ -254,6 +309,7 @@ def load_top_events(db_path: str | Path, limit: int | None = None) -> list[dict]
             bursts=bursts,
             weights=cfg.get("weights"),
             freshness_half_life_hours=cfg.get("freshness_half_life_hours"),
+            hashtag_penalty_max=cfg.get("hashtag_penalty_max"),
         )
         for ev in ranked:
             name_zh = (ev.get("name_zh") or "").strip()

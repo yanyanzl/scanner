@@ -59,6 +59,12 @@ Telegram 提醒之外，爆发事件再打一份进用户自己浏览器（Chrom
 按 version 决定怎么处理；老版本的消息靠 `scanner-alert` 这个 token
 一直能认出来。
 
+**注意：每日质量简报用的是另一个标记**（`quality-digest v1`，
+见 `docs/QUALITY_DIGEST.md`），不是爆发提醒。`parse_scanner_marker`
+不会把简报认成爆发提醒；反过来简报的识别函数也不会认爆发提醒。
+两者走同一条发送通道（同一个 `send_to_muse_chat`），只是首行标记
+和内容不同。
+
 ## 消息去向与计数
 
 - 发的是同一批 `alert_bursts`：已过质量门槛（条数 ≥ 20 或总分 ≥ 5，2026-11-16

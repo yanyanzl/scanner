@@ -184,11 +184,13 @@ def _ranking_top_events(events: list[dict], bursts: list[dict], cfg: dict) -> li
         ranking = cfg.get("ranking") or {}
         weights = ranking.get("weights") if isinstance(ranking.get("weights"), dict) else None
         half_life = ranking.get("freshness_half_life_hours")
+        penalty_max = ranking.get("hashtag_penalty_max")
         ranked = rank_events(
             events,
             bursts=bursts,
             weights=weights,
             freshness_half_life_hours=(float(half_life) if half_life is not None else None),
+            hashtag_penalty_max=(float(penalty_max) if penalty_max is not None else None),
         )
         return ranked[:TOP_TRANSLATE_EVENTS]
     except Exception as exc:
@@ -801,6 +803,15 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
             counts["bursts_recurrence"] = 0
     finally:
         conn.close()
+
+    # 每日质量简报：记下本轮的计数（按本地日期分桶，供次日 8 点的
+    # 质量简报汇总；失败不影响本轮，见 trend_radar/quality_digest.py）。
+    try:
+        from trend_radar.quality_digest import record_round_counts
+
+        record_round_counts(db_path, counts)
+    except Exception as exc:
+        logger.warning("质量简报计数记录失败（不影响采集）: %s", exc)
 
     counts["saved"] = saved
     logger.info("本轮采集完成: %s", counts)

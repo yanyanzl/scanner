@@ -133,6 +133,17 @@ muse_chat:
   method: auto  # auto | applescript | cdp | safari；auto = macOS 用 AppleScript，Windows 用 CDP；macOS 也可填 safari 走 Safari（2026-11-15 起 Chrome 的 AppleScript 在本机不可用，见 docs/MUSE_CHAT.md）
   cdp_port: 9222
 
+# 每日质量简报（2026-11-16，见 docs/QUALITY_DIGEST.md）：每天早上 hour 点
+# （调度器本地时间）把昨日的质量摘要打进 Muse 对话（走 muse_chat 的
+# 发送通道），让 Cheese 收到后分析并优化。muse_chat 没启用时不发；
+# enabled: false 可彻底关闭。内容：Top 5 事件、当日计数（事件/爆发/
+# 重复抑制/Telegram/Muse 发送数）、质量信号（Top 10 单平台数、
+# hashtag 占比高的事件数、recurrence 事件数）。轮次计数存在
+# data/.quality_daily.json（只保留昨天和今天），不进仓库。
+quality_digest:
+  enabled: true
+  hour: 8
+
 # 标题自动翻译：只翻优先内容（Top 5 事件名 + 爆发事件名 + 各事件最高分
 # 成员标题），其他内容保持英文。Azure 主用、每轮都跑（每轮 600 字符硬
 # 上限 + 每月 180 万字符上限，用 data/.azure_usage.json 计数）；
@@ -198,3 +209,9 @@ ranking:
     cross_platform: 0.20
     novelty: 0.10
   freshness_half_life_hours: 24
+  # hashtag 惩罚上限（综合分里的绝对扣分数，2026-11-16 20:28 截图后加）：
+  # 事件名里 hashtag 占的字符比例越高扣得越多，扣满就是这个数。
+  # 截图证据：Top 10 里 #2 纯 hashtag 印尼标题（占比约 0.93）、#3 小丑
+  # （占比约 0.51），扣满 20 分后分别剩约 8 分和约 14 分、掉出前 3，
+  # #1 真事件（占比 0）不受影响。初始假设，未校准。
+  hashtag_penalty_max: 20.0

@@ -26,6 +26,16 @@
     小时；不做 min-max——新鲜度有绝对含义（“多久以前首次出现”），
     不是相对量。first_seen 缺失或解析失败时按“很老”算（0 分）。
 
+  hashtag 惩罚（2026-11-16 20:28 截图后加）：综合分算完后减去
+    hashtag_penalty_max × hashtag_ratio（事件原名里 hashtag 占的
+    字符比例，默认上限 20 分，最低扣到 0 分）。标题大半是 hashtag
+    的“事件”其实是短视频标题，不是新闻事件——不惩罚时它们靠增长
+    分量混进 Top 10 前 3（小丑 24.6、纯 hashtag 印尼标题 26.2）。
+    惩罚是减法不是门槛：固定门槛（如 30 分）在批内相对分里没有
+    稳定含义，截图这批只有 1 个事件过 30，设门槛榜单就空了；
+    减法让榜单照常填满、junk 被压下去，junk 的规模由每日质量简报
+    里的质量信号追踪（见 docs/QUALITY_DIGEST.md）。
+
 归一化说明：min-max 是在本批事件内部算的，所以排名是相对的，不
 是绝对的——同一事件在不同轮的综合分不能直接比较。某个分量在全批
 里都一样（max == min）时，该分量对所有事件都记 0.5 分，不会除零。
@@ -51,6 +61,7 @@ from pathlib import Path
 from typing import Any
 
 from trend_radar.scoring import parse_dt
+from trend_radar.text_utils import hashtag_ratio
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -65,6 +76,22 @@ DEFAULT_WEIGHTS = {
 }
 DEFAULT_HALF_LIFE_HOURS = 24.0
 DEFAULT_TOP_N = 10
+
+# hashtag 惩罚上限（综合分 0-100 里的绝对扣分数，初始假设，未校准）：
+# 事件名里 hashtag 占的字符比例越高扣得越多，扣满就是这个数。
+# 2026-11-16 20:28 截图证据：Top 10 里 #2 是纯 hashtag 印尼标题
+# （占比约 0.93）、#3 小丑（占比约 0.51），扣满 20 分后两者分别剩
+# 约 8 分和约 14 分，掉出前 3；#1 真事件（占比 0）不受影响。
+# 为什么是“惩罚”而不是“绝对门槛”：综合分是批内相对分，固定门槛
+# （如 30 分）在不同轮次含义不同——截图这批只有 #1 过 30，设门槛
+# Top 10 只剩 1 条，榜单大部分时间是空的；惩罚式扣分让榜单照常填满，
+# junk 只是被压下去，同时简报里的质量信号（Top 10 单平台数、
+# hashtag 占比高的事件数）让 junk 的规模始终可见、可追踪。
+# 改这里不用改代码：config.yaml 的 ranking.hashtag_penalty_max。
+DEFAULT_HASHTAG_PENALTY_MAX = 20.0
+
+# 原因里写 hashtag 的阈值：占比低于它时扣分很小，不值得占一个原因位。
+HASHTAG_REASON_MIN_RATIO = 0.2
 
 # 爆发规则名 -> 展示用中文（与 trend_radar/alerts.py 保持一致）。
 BURST_REASON_WORDS = {
@@ -83,12 +110,14 @@ _WEIGHT_KEYS = ("growth", "member_strength", "burst", "cross_platform", "novelty
 def load_ranking_config() -> dict:
     """读 config.yaml 的 ranking 一节；读不到就用默认（不依赖 yaml 是否安装）。
 
-    返回 {"top_n", "weights", "freshness_half_life_hours"}。
+    返回 {"top_n", "weights", "freshness_half_life_hours",
+    "hashtag_penalty_max"}。
     """
     cfg = {
         "top_n": DEFAULT_TOP_N,
         "weights": dict(DEFAULT_WEIGHTS),
         "freshness_half_life_hours": DEFAULT_HALF_LIFE_HOURS,
+        "hashtag_penalty_max": DEFAULT_HASHTAG_PENALTY_MAX,
     }
     try:
         import yaml  # type: ignore
@@ -105,6 +134,10 @@ def load_ranking_config() -> dict:
                         cfg["weights"][key] = float(weights[key])
             if section.get("freshness_half_life_hours") is not None:
                 cfg["freshness_half_life_hours"] = float(section["freshness_half_life_hours"])
+            if section.get("hashtag_penalty_max") is not None:
+                cfg["hashtag_penalty_max"] = max(
+                    0.0, float(section["hashtag_penalty_max"])
+                )
     except Exception:
         pass
     return cfg
@@ -158,12 +191,15 @@ def _rank_reasons(
     age_hours: float | None,
     is_fastest_growth: bool,
     is_recurrence: bool = False,
+    tag_ratio: float = 0.0,
 ) -> list[str]:
     """给一个事件生成展示用的原因（中文短语，只写有信息量的）。
 
-    顺序：爆发原因 → 平台数 → 增长最快 → 新鲜度；什么都没命中时
-    兜底写最高分，保证原因列表永远非空。重复出现的事件不写爆发
-    原因、也不写“首次出现”（它不是新故事）。
+    顺序：爆发原因 → 平台数 → 增长最快 → 新鲜度 → hashtag 占比；
+    什么都没命中时兜底写最高分，保证原因列表永远非空。重复出现的
+    事件不写爆发原因、也不写“首次出现”（它不是新故事）。hashtag
+    占比达到阈值时写出来——扣分要有出处，榜上的人能看出来为什么
+    这个事件被压下去了。
     """
     reasons: list[str] = []
     for reason in burst_reasons:
@@ -180,6 +216,8 @@ def _rank_reasons(
             reasons.append("1 小时内首次出现")
         else:
             reasons.append(f"{int(round(age_hours))} 小时前首次出现")
+    if tag_ratio >= HASHTAG_REASON_MIN_RATIO:
+        reasons.append(f"hashtag 占比 {tag_ratio:.0%}")
     if not reasons:
         max_score = float(event.get("max_score") or 0)
         reasons.append(f"最高分 {max_score:.2f}")
@@ -192,12 +230,19 @@ def rank_events(
     now: datetime | str | None = None,
     weights: dict | None = None,
     freshness_half_life_hours: float | None = None,
+    hashtag_penalty_max: float | None = None,
 ) -> list[dict]:
     """把事件按综合分从高到低排好。
 
     每个返回项是输入 dict 的浅拷贝，加 rank_score（0-100，1 位小数）
-    和 rank_reasons（中文短语列表）。不改动输入；空输入返回 []；
-    同分按 event_id 排，同一输入永远得到同一顺序。
+    和 rank_reasons（中文短语列表），另加 hashtag_ratio（事件名里
+    hashtag 占的字符比例）和 is_recurrence（是不是重复出现，供
+    Dashboard 与简报直接读，不用再查一次 burst 列表）。不改动输入；
+    空输入返回 []；同分按 event_id 排，同一输入永远得到同一顺序。
+
+    hashtag 惩罚：综合分算完后减去 hashtag_penalty_max ×
+    hashtag_ratio（按事件原名算，翻译后的中文名不影响），最低扣到
+    0 分。hashtag_penalty_max 为 None 时用默认值 20.0；传 0 关闭惩罚。
     """
     if not events:
         return []
@@ -210,6 +255,11 @@ def rank_events(
 
     resolved_weights = _resolve_weights(weights)
     half_life = _resolve_half_life(freshness_half_life_hours, weights)
+    penalty_max = (
+        DEFAULT_HASHTAG_PENALTY_MAX
+        if hashtag_penalty_max is None
+        else max(0.0, float(hashtag_penalty_max))
+    )
 
     burst_by_id: dict[str, list[str]] = {}
     recurrence_ids: set[str] = set()
@@ -253,14 +303,24 @@ def rank_events(
             + resolved_weights["cross_platform"] * platform_norm[idx]
             + resolved_weights["novelty"] * novelty
         )
+        # hashtag 惩罚：标题大半是 hashtag 的事件（短视频标题常见）
+        # 不是“新闻事件”，是“视频标题”——扣分把它压下去。按事件原名
+        # 算占比（翻译后的中文名不影响判定），扣分是绝对分（0-100 分
+        # 制里直接减），不是乘系数：高分真事件带少量 hashtag 时只扣
+        # 一点，junk 事件占比高时扣满。扣完最低 0 分。
+        tag_ratio = hashtag_ratio(ev.get("name") or "")
+        score = max(0.0, score * 100 - penalty_max * tag_ratio)
         out = dict(ev)
-        out["rank_score"] = round(score * 100, 1)
+        out["rank_score"] = round(score, 1)
+        out["hashtag_ratio"] = round(tag_ratio, 2)
+        out["is_recurrence"] = is_recurrence
         out["rank_reasons"] = _rank_reasons(
             ev,
             burst_reasons,
             age_hours,
             is_fastest_growth=(growth_raw[idx] > 0 and growth_raw[idx] >= max_growth),
             is_recurrence=is_recurrence,
+            tag_ratio=tag_ratio,
         )
         ranked.append(out)
     ranked.sort(key=lambda e: (-e["rank_score"], e.get("event_id") or ""))

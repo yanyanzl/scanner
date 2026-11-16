@@ -218,5 +218,114 @@ class TestRankEvents(unittest.TestCase):
         self.assertNotEqual(gap_default, gap_short)
 
 
+def _screenshot_batch():
+    """2026-11-16 20:28 Dashboard 截图的 Top 10 批（mock，数值取自截图）。
+
+    #1 警察局长讲话（增长 1544.73，最高分 0.4555，总分 45.95）；
+    #2 纯 hashtag 印尼标题（增长 375.67，最高分 0.35）；
+    #3 小丑（增长 169.26，最高分 0.34，总分 2.94，11 条）；
+    其余 7 条取自截图的增长/分数。未惩罚时顺序与截图一致
+    （警察局长、hashtag、小丑前 3）。
+    """
+    now = datetime(2026, 11, 16, 20, 30, tzinfo=timezone.utc)
+
+    def ev(eid, name, growth, max_score, total_score, age_h, items=1):
+        return {
+            "event_id": eid,
+            "name": name,
+            "name_zh": None,
+            "first_seen": (now - timedelta(hours=age_h)).isoformat(),
+            "platforms": ["youtube"],
+            "platform_count": 1,
+            "item_count": items,
+            "total_score": total_score,
+            "max_score": max_score,
+            "max_growth": growth,
+            "trend": "rising",
+            "items": [],
+        }
+
+    return now, [
+        ev("evt_police", "BREAKING NEWS - Arahan Kapolri Suyudi di HUT ke-81 Brimob Polri", 1544.73, 0.4555, 45.95, 1.81, items=146),
+        ev("evt_hashtag", "最新消息#rakyat#KPK #klipingberita #politikindonesia #fayruseh #dpr", 375.67, 0.35, 0.35, 2.0),
+        ev("evt_clown", "Clown's Artificial Intelligence#cosplay #shorts #SpiderMan#kpop", 169.26, 0.34, 2.94, 20.0, items=11),
+        ev("evt_arabic", "الذكاء الاصطناعي 😂 #ضحك #الكويت #تحشيش #اشتراك_بالقناة", 185.76, 0.30, 0.30, 6.0),
+        ev("evt_aimachine", "人工智能——如果我们只是机器呢？", 65.26, 0.30, 0.30, 2.0),
+        ev("evt_loultimo", "LO ULTIMO !! JORGE ALFREDO VARGAS", 57.42, 0.30, 0.30, 2.0),
+        ev("evt_realai", "现实生活与人工智能", 258.97, 0.34, 0.34, 14.0),
+        ev("evt_whatbox", "“What box?” Has AI already escaped? 🤔 #ai #aieffects #artificialintelligence", 37.39, 0.30, 0.30, 1.0),
+        ev("evt_russian", "627. Искусственный интеллект против содержанок", 57.86, 0.30, 0.30, 8.0),
+        ev("evt_musk", "埃隆·马斯克关于谷歌人工智能的看法是对的吗？ #AI#Google #ElonMusk #ArtificialIntelligence", 89.83, 0.32, 0.32, 13.0),
+    ]
+
+
+class TestHashtagPenalty(unittest.TestCase):
+    def test_screenshot_order_without_penalty(self):
+        """惩罚关掉时，截图的顺序重现：警察局长、hashtag、小丑前 3。"""
+        now, batch = _screenshot_batch()
+        ranked = rank_events(batch, now=now, hashtag_penalty_max=0)
+        top3 = [e["event_id"] for e in ranked[:3]]
+        self.assertEqual(top3, ["evt_police", "evt_hashtag", "evt_clown"])
+
+    def test_hashtag_and_clown_drop_out_of_top3(self):
+        """默认惩罚（上限 20 分）：小丑与纯 hashtag 标题掉出前 3，
+        警察局长（占比 0）仍是第 1。"""
+        now, batch = _screenshot_batch()
+        ranked = rank_events(batch, now=now)
+        self.assertEqual(ranked[0]["event_id"], "evt_police")
+        top3 = [e["event_id"] for e in ranked[:3]]
+        self.assertNotIn("evt_clown", top3)
+        self.assertNotIn("evt_hashtag", top3)
+
+    def test_penalty_proportional_to_ratio(self):
+        """扣分与 hashtag 占比成正比：占比越高扣得越多。"""
+        now, batch = _screenshot_batch()
+        ranked = {e["event_id"]: e for e in rank_events(batch, now=now)}
+        plain = {e["event_id"]: e for e in rank_events(batch, now=now, hashtag_penalty_max=0)}
+        for eid in ("evt_hashtag", "evt_clown", "evt_musk"):
+            drop = plain[eid]["rank_score"] - ranked[eid]["rank_score"]
+            self.assertGreater(drop, 0)
+            # rank_score 输出只保留 1 位小数，差值与 20×占比允许 0.2 误差。
+            self.assertAlmostEqual(
+                drop, 20.0 * ranked[eid]["hashtag_ratio"], delta=0.2
+            )
+        # 占比 0 的警察局长一分不扣。
+        self.assertEqual(
+            ranked["evt_police"]["rank_score"], plain["evt_police"]["rank_score"]
+        )
+
+    def test_hashtag_ratio_and_recurrence_in_output(self):
+        """输出里带 hashtag_ratio 与 is_recurrence，供简报与 Dashboard 直接读。"""
+        now, batch = _screenshot_batch()
+        bursts = [{"event_id": "evt_realai", "reasons": ["growth_spike"], "is_recurrence": True}]
+        ranked = {e["event_id"]: e for e in rank_events(batch, bursts=bursts, now=now)}
+        self.assertGreater(ranked["evt_hashtag"]["hashtag_ratio"], 0.8)
+        self.assertAlmostEqual(ranked["evt_clown"]["hashtag_ratio"], 0.51, places=2)
+        self.assertEqual(ranked["evt_police"]["hashtag_ratio"], 0.0)
+        self.assertTrue(ranked["evt_realai"]["is_recurrence"])
+        self.assertFalse(ranked["evt_police"]["is_recurrence"])
+
+    def test_hashtag_reason_shown(self):
+        """占比达到阈值时，原因里写出 hashtag 占比（扣分有出处）。"""
+        now, batch = _screenshot_batch()
+        ranked = {e["event_id"]: e for e in rank_events(batch, now=now)}
+        self.assertTrue(
+            any("hashtag" in r for r in ranked["evt_clown"]["rank_reasons"])
+        )
+        self.assertFalse(
+            any("hashtag" in r for r in ranked["evt_police"]["rank_reasons"])
+        )
+
+    def test_config_file_has_penalty_key(self):
+        """config.yaml 里有 ranking.hashtag_penalty_max（默认 20.0）。"""
+        from trend_radar.event_ranking import load_ranking_config
+
+        text = (Path(__file__).resolve().parent.parent / "config.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("hashtag_penalty_max", text)
+        self.assertEqual(load_ranking_config()["hashtag_penalty_max"], 20.0)
+
+
 if __name__ == "__main__":
     unittest.main()

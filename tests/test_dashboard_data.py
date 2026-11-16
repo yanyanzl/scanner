@@ -103,6 +103,72 @@ class TestLoadItems(unittest.TestCase):
         self.assertEqual(fastest[0]["title"], "High score")
 
 
+class TestLoadItemsRecurrence(unittest.TestCase):
+    """实时热点榜去掉定时重复播报（任务 3）。
+
+    场景复现 2026-11-16 20:28 截图：热点榜前 3 里有 2 个是定时重复
+    播报（每小时直播、2PM 头条）。两条同标题直播视频（新 URL、新
+    视频）与库里已有的老事件同名（去掉日期后相同），且老事件最近
+    一次快照是跨平台的 → 当前事件是 recurrence，其成员不进榜单；
+    真新闻（克什米尔地震）不受影响。
+    """
+
+    LIVE_TITLE = "今日突发新闻直播 | 本时头条新闻 | 本小时头条 | 15.11.2026"
+
+    def setUp(self):
+        from datetime import datetime, timedelta, timezone
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp.name) / "trends.sqlite3"
+        self.conn = dbmod.connect(self.db_path)
+        _seed(
+            self.conn,
+            [
+                (_item("youtube", self.LIVE_TITLE, "https://youtube.com/watch?v=AAA"), 9.0),
+                (_item("youtube", self.LIVE_TITLE, "https://youtube.com/watch?v=BBB"), 8.0),
+                (_item("rss", "克什米尔地震", "https://example.com/quake"), 5.0),
+            ],
+        )
+        # 老事件（双胞胎）：同名、首次出现比当前事件早、最近快照跨平台。
+        now = datetime.now(timezone.utc)
+        last_seen = (now - timedelta(hours=1)).isoformat()
+        self.conn.execute(
+            "INSERT INTO events (event_id, name, first_seen, last_seen,"
+            " platform_count, item_count, total_score, max_score, max_growth)"
+            " VALUES ('evt_old', ?, '2026-11-14T07:00:00+00:00', ?, 2, 10, 5.0, 0.5, 100.0)",
+            (self.LIVE_TITLE, last_seen),
+        )
+        self.conn.execute(
+            "INSERT INTO event_snapshots (event_id, collected_at, item_count,"
+            " platform_count, total_score, max_score, max_growth, platforms)"
+            " VALUES ('evt_old', ?, 10, 2, 5.0, 0.5, 100.0, 'rss,youtube')",
+            (last_seen,),
+        )
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_recurrence_items_excluded(self):
+        titles = [
+            it["title"]
+            for it in load_items(self.db_path, exclude_recurrence=True)
+        ]
+        self.assertEqual(titles, ["克什米尔地震"])
+
+    def test_default_keeps_everything(self):
+        titles = [it["title"] for it in load_items(self.db_path)]
+        self.assertEqual(
+            titles, [self.LIVE_TITLE, self.LIVE_TITLE, "克什米尔地震"]
+        )
+
+    def test_limit_still_respected(self):
+        self.assertEqual(
+            len(load_items(self.db_path, limit=1, exclude_recurrence=True)), 1
+        )
+
+
 class TestLoadHistory(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

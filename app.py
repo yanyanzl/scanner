@@ -27,7 +27,10 @@ st.title("🌍 Global Trend Radar — 全球热点雷达")
 platform = st.selectbox(
     "平台筛选", ["全部", "rss", "gdelt", "reddit", "youtube", "x", "tiktok"]
 )
-items = load_items(DB_PATH, platform)
+# 实时热点榜去掉定时重复播报（每小时直播、2PM 头条这类标题去掉日期后
+# 与之前出现过的事件相同的条目，见 dashboard_data.load_items）——
+# 它们仍在库里，Top 10 / 最快增长 / 爆发各节不受影响。
+items = load_items(DB_PATH, platform, exclude_recurrence=True)
 
 if not items:
     st.warning(

@@ -1,6 +1,7 @@
 """SQLite 存储：内容 + 每次采集的快照（用于算增长速度和加速度）。"""
 from __future__ import annotations
 
+import html
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -102,6 +103,18 @@ def set_event_name_zh(conn: sqlite3.Connection, event_id: str, name_zh: str) -> 
 
 
 def upsert_item(conn: sqlite3.Connection, item: dict, score_result: dict) -> int:
+    # 标题入库前解一次 HTML 实体：YouTube 等来源的标题里会带 &#39;、
+    # &amp;、&quot; 这类实体（2026-11-16 20:28 截图：Dashboard 里
+    # "Today&#39;s Breaking News LIVE" 原样显示）。这里是所有入库
+    # 写入的唯一 choke 点（collector 只走这里），解一次、库里就是
+    # 干净文本，下游（Dashboard/提醒/排名/聚类）全部受益。只解一次：
+    # html.unescape 是单遍扫描，"&amp;#39;" 只解成 "&#39;"，不会
+    # 二次解码把合法文本改坏；已经干净的标题解完不变。title_zh
+    # 同理（翻译返回的中文标题理论上干净，顺手一起解，防万一）。
+    title = html.unescape(item.get("title", "") or "")
+    title_zh = item.get("title_zh")
+    if title_zh:
+        title_zh = html.unescape(title_zh)
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         """
@@ -122,14 +135,14 @@ def upsert_item(conn: sqlite3.Connection, item: dict, score_result: dict) -> int
         """,
         (
             item.get("platform", ""),
-            item.get("title", ""),
+            title,
             item.get("url", ""),
             item.get("published_at"),
             item.get("first_seen") or now,
             item.get("source", ""),
             item.get("language", ""),
             item.get("summary_zh", ""),
-            item.get("title_zh"),
+            title_zh,
             score_result.get("score", 0),
             score_result.get("growth", 0),
             score_result.get("acceleration", 0),

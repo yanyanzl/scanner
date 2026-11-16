@@ -38,15 +38,11 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 # 没有可翻译内容的标记：URL、@提及、#hashtag。去掉它们后再判断剩余
 # 字母——纯标记文本（纯 hashtag 串、纯 URL、纯 @提及）翻了也等于没翻。
-_UNTRANSLATABLE_TOKEN_RE = re.compile(r"https?://\S+|www\.\S+|@\w+|#\S+")
-
-
-def _strip_untranslatable_tokens(text: str) -> str:
-    """去掉文本里的 URL、@提及、#hashtag，剩下的才是可能要翻的内容。
-
-    注意顺序：URL 在先——URL 里可能带 # 片段（如 .../page#section），
-    先去 hashtag 会只去掉片段、留下带字母的 URL 本体。"""
-    return _UNTRANSLATABLE_TOKEN_RE.sub("", text)
+# 实现在 trend_radar/text_utils.py（排名模块也要用 hashtag 相关逻辑，
+# 提出来避免两处各写一份）；这里留个别名，老调用方不用改。
+from trend_radar.text_utils import (
+    strip_untranslatable_tokens as _strip_untranslatable_tokens,
+)
 
 
 def needs_translation(text: str) -> bool:
