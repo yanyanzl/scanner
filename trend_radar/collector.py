@@ -205,6 +205,8 @@ def _collect_priority_texts(
     事件名在前、成员标题在后——每轮 600 字符预算不够时先砍成员标题，
     事件名优先保住（提醒和榜单上先看到的都是事件名）。同一文本只
     出现一次（事件名经常就是它分数最高的成员标题），用途合并记录。
+    没有可翻译内容的文本（纯 hashtag 串、纯 URL、纯 @提及）直接跳过，
+    不进目标集（见 add 里的 needs_translation 判定）。
     每条形如 {"text": ..., "events": {event_id, ...}, "items": {title, ...}}：
     events 是以该文本为事件名的事件，items 是以该文本为成员标题的条目。
     """
@@ -214,6 +216,13 @@ def _collect_priority_texts(
     def add(text: str, event_id: str | None = None, item_title: str | None = None) -> None:
         text = (text or "").strip()
         if not text:
+            return
+        # 没有可翻译内容的文本不进翻译目标集：纯 hashtag 串、纯 URL、
+        # 纯 @提及等——Azure 对这类文本原样返回，翻了等于没翻，还占
+        # 预算、误报“没有可用译文”（2026-11-16 10:03 轮实测）。用
+        # needs_translation 判定（去掉 URL/@提及/hashtag 后没有字母
+        # 的跳过）；带正文的标题哪怕带 hashtag 也照常进集。
+        if not translate_mod.needs_translation(text):
             return
         entry = index.get(text)
         if entry is None:

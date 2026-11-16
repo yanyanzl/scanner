@@ -53,6 +53,45 @@ class TestNeedsTranslation(unittest.TestCase):
         self.assertFalse(needs_translation("!!!"))
         self.assertFalse(needs_translation("12345"))
 
+    def test_hashtag_only_false(self):
+        # 纯 hashtag 串不翻译：2026-11-16 10:03 轮实测，Azure 对这类文本
+        # 原样返回（译文与原文相同），算成“没有可用译文”还占预算。
+        self.assertFalse(
+            needs_translation(
+                "#generalknowledge #fact #technology #science #machine "
+                "#marathiculture#maharashtra#marathisciencewala"
+            )
+        )
+        self.assertFalse(needs_translation("#AI #news"))
+        self.assertFalse(needs_translation("#shorts"))
+
+    def test_mixed_with_hashtags_true(self):
+        # 带正文的标题照常翻译：去掉 hashtag 后仍有字母。
+        self.assertTrue(
+            needs_translation(
+                "Clown's Artificial Intelligence#cosplay #shorts #SpiderMan#kpop"
+            )
+        )
+        self.assertTrue(needs_translation("Breaking news #live"))
+
+    def test_short_word_true(self):
+        # 短词也要翻：只有“完全没有字母”才跳过，不设字母数阈值。
+        self.assertTrue(needs_translation("AI"))
+        self.assertTrue(needs_translation("OK"))
+
+    def test_url_and_mention_only_false(self):
+        # 纯 URL / 纯 @提及没有可翻译内容：去掉标记后没有字母。
+        self.assertFalse(needs_translation("https://youtu.be/dQw4w9WgXcQ"))
+        self.assertFalse(needs_translation("https://example.com/page#section"))
+        self.assertFalse(needs_translation("www.bbc.com/news"))
+        self.assertFalse(needs_translation("@BBCWorld"))
+
+    def test_url_mention_with_text_true(self):
+        # 带正文的标题照常翻：去掉 URL/@提及后仍有字母。
+        self.assertTrue(needs_translation("Breaking news https://example.com/x"))
+        self.assertTrue(needs_translation("@BBCWorld: Big story today"))
+        self.assertTrue(needs_translation("AI #news"))
+
 
 if __name__ == "__main__":
     unittest.main()

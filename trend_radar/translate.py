@@ -36,6 +36,18 @@ CJK_ALREADY_CHINESE_RATIO = 0.9
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
+# 没有可翻译内容的标记：URL、@提及、#hashtag。去掉它们后再判断剩余
+# 字母——纯标记文本（纯 hashtag 串、纯 URL、纯 @提及）翻了也等于没翻。
+_UNTRANSLATABLE_TOKEN_RE = re.compile(r"https?://\S+|www\.\S+|@\w+|#\S+")
+
+
+def _strip_untranslatable_tokens(text: str) -> str:
+    """去掉文本里的 URL、@提及、#hashtag，剩下的才是可能要翻的内容。
+
+    注意顺序：URL 在先——URL 里可能带 # 片段（如 .../page#section），
+    先去 hashtag 会只去掉片段、留下带字母的 URL 本体。"""
+    return _UNTRANSLATABLE_TOKEN_RE.sub("", text)
+
 
 def needs_translation(text: str) -> bool:
     """标题是否需要翻译：空、纯中文（CJK 占比 >= 0.9）、无字母的返回 False，
@@ -43,10 +55,19 @@ def needs_translation(text: str) -> bool:
 
     字母用 str.isalpha() 判断，不只算拉丁字母——否则纯马拉雅拉姆语、
     纯阿拉伯语、纯俄语等标题（一个拉丁/CJK 字母都没有）会被误判为
-    “没有字母”而跳过翻译。"""
+    “没有字母”而跳过翻译。
+
+    纯标记文本也不翻：先去掉 URL、@提及、#hashtag 再看剩余字母。
+    2026-11-16 10:03 轮实测：Azure 对纯 hashtag 串原样返回（HTTP 200，
+    译文与原文相同），代码算成“没有可用译文”还占掉本轮预算；这类文本
+    翻了也等于没翻。调用方在收集翻译目标时就直接跳过这类文本（不调
+    接口、不占预算、不报 warning）。带正文的标题不受影响，如
+    "Clown's Artificial Intelligence#cosplay #shorts" 去掉 hashtag 后
+    仍有字母，照常翻译。"""
     if not text or not text.strip():
         return False
-    letters = [ch for ch in text if ch.isalpha()]
+    rest = _strip_untranslatable_tokens(text)
+    letters = [ch for ch in rest if ch.isalpha()]
     if not letters:
         return False
     cjk = sum(1 for ch in letters if _CJK_RE.match(ch))
