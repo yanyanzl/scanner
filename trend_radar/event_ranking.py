@@ -36,6 +36,14 @@
     减法让榜单照常填满、junk 被压下去，junk 的规模由每日质量简报
     里的质量信号追踪（见 docs/QUALITY_DIGEST.md）。
 
+  通用标题惩罚（2026-11-17 11:45 截图后加）：去掉通用词（突发新闻
+    / 最新消息 / 最新资讯 / 今日头条 / BREAKING NEWS / LATEST NEWS /
+    JUST IN）后一个字母都不剩的标题（如光秃秃的“突发新闻”），综合
+    分减去 generic_title_penalty_max（默认 15 分，最低扣到 0 分）。
+    判定见 trend_radar/text_utils.py::is_generic_title。带通用词但
+    有实质内容的标题（“突发新闻：赛义德·霍孔被捕”）不扣。两个惩罚
+    是独立的减法，可叠加（既通用又 hashtag 重的标题两项都扣）。
+
 归一化说明：min-max 是在本批事件内部算的，所以排名是相对的，不
 是绝对的——同一事件在不同轮的综合分不能直接比较。某个分量在全批
 里都一样（max == min）时，该分量对所有事件都记 0.5 分，不会除零。
@@ -61,7 +69,7 @@ from pathlib import Path
 from typing import Any
 
 from trend_radar.scoring import parse_dt
-from trend_radar.text_utils import hashtag_ratio
+from trend_radar.text_utils import hashtag_ratio, is_generic_title
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -95,6 +103,16 @@ DEFAULT_HASHTAG_PENALTY_MAX = 30.0
 # 原因里写 hashtag 的阈值：占比低于它时扣分很小，不值得占一个原因位。
 HASHTAG_REASON_MIN_RATIO = 0.2
 
+# 通用标题惩罚上限（综合分 0-100 里的绝对扣分数，初始假设，未校准）：
+# 事件名去掉通用词后一个字母都不剩的标题（如光秃秃的“突发新闻”），
+# 扣满就是这个数。判定见 trend_radar/text_utils.py::is_generic_title。
+# 2026-11-17 11:45 截图证据：Top 10 里 #3 是光秃秃的“突发新闻”
+# 22 分，扣 15 剩约 7 分、掉出 Top 10；#4/#5/#6 带通用词但有实质
+# 内容，不扣；#1 真事件不受影响。mock 批实测见
+# tests/test_event_ranking.py 的 TestGenericTitlePenalty。
+# 改这里不用改代码：config.yaml 的 ranking.generic_title_penalty_max。
+DEFAULT_GENERIC_TITLE_PENALTY_MAX = 15.0
+
 # 爆发规则名 -> 展示用中文（与 trend_radar/alerts.py 保持一致）。
 BURST_REASON_WORDS = {
     "growth_spike": "增速突增",
@@ -113,13 +131,14 @@ def load_ranking_config() -> dict:
     """读 config.yaml 的 ranking 一节；读不到就用默认（不依赖 yaml 是否安装）。
 
     返回 {"top_n", "weights", "freshness_half_life_hours",
-    "hashtag_penalty_max"}。
+    "hashtag_penalty_max", "generic_title_penalty_max"}。
     """
     cfg = {
         "top_n": DEFAULT_TOP_N,
         "weights": dict(DEFAULT_WEIGHTS),
         "freshness_half_life_hours": DEFAULT_HALF_LIFE_HOURS,
         "hashtag_penalty_max": DEFAULT_HASHTAG_PENALTY_MAX,
+        "generic_title_penalty_max": DEFAULT_GENERIC_TITLE_PENALTY_MAX,
     }
     try:
         import yaml  # type: ignore
@@ -139,6 +158,10 @@ def load_ranking_config() -> dict:
             if section.get("hashtag_penalty_max") is not None:
                 cfg["hashtag_penalty_max"] = max(
                     0.0, float(section["hashtag_penalty_max"])
+                )
+            if section.get("generic_title_penalty_max") is not None:
+                cfg["generic_title_penalty_max"] = max(
+                    0.0, float(section["generic_title_penalty_max"])
                 )
     except Exception:
         pass
@@ -194,14 +217,15 @@ def _rank_reasons(
     is_fastest_growth: bool,
     is_recurrence: bool = False,
     tag_ratio: float = 0.0,
+    is_generic: bool = False,
 ) -> list[str]:
     """给一个事件生成展示用的原因（中文短语，只写有信息量的）。
 
-    顺序：爆发原因 → 平台数 → 增长最快 → 新鲜度 → hashtag 占比；
-    什么都没命中时兜底写最高分，保证原因列表永远非空。重复出现的
-    事件不写爆发原因、也不写“首次出现”（它不是新故事）。hashtag
-    占比达到阈值时写出来——扣分要有出处，榜上的人能看出来为什么
-    这个事件被压下去了。
+    顺序：爆发原因 → 平台数 → 增长最快 → 新鲜度 → hashtag 占比 →
+    通用标题；什么都没命中时兜底写最高分，保证原因列表永远非空。
+    重复出现的事件不写爆发原因、也不写“首次出现”（它不是新故事）。
+    hashtag 占比达到阈值时写出来——扣分要有出处，榜上的人能看出来
+    为什么这个事件被压下去了；通用标题同理，写“通用标题”一句。
     """
     reasons: list[str] = []
     for reason in burst_reasons:
@@ -220,6 +244,8 @@ def _rank_reasons(
             reasons.append(f"{int(round(age_hours))} 小时前首次出现")
     if tag_ratio >= HASHTAG_REASON_MIN_RATIO:
         reasons.append(f"hashtag 占比 {tag_ratio:.0%}")
+    if is_generic:
+        reasons.append("通用标题")
     if not reasons:
         max_score = float(event.get("max_score") or 0)
         reasons.append(f"最高分 {max_score:.2f}")
@@ -233,18 +259,25 @@ def rank_events(
     weights: dict | None = None,
     freshness_half_life_hours: float | None = None,
     hashtag_penalty_max: float | None = None,
+    generic_title_penalty_max: float | None = None,
 ) -> list[dict]:
     """把事件按综合分从高到低排好。
 
     每个返回项是输入 dict 的浅拷贝，加 rank_score（0-100，1 位小数）
     和 rank_reasons（中文短语列表），另加 hashtag_ratio（事件名里
-    hashtag 占的字符比例）和 is_recurrence（是不是重复出现，供
-    Dashboard 与简报直接读，不用再查一次 burst 列表）。不改动输入；
-    空输入返回 []；同分按 event_id 排，同一输入永远得到同一顺序。
+    hashtag 占的字符比例）、is_generic_title（事件名是不是通用标题）
+    和 is_recurrence（是不是重复出现，供 Dashboard 与简报直接读，
+    不用再查一次 burst 列表）。不改动输入；空输入返回 []；同分按
+    event_id 排，同一输入永远得到同一顺序。
 
     hashtag 惩罚：综合分算完后减去 hashtag_penalty_max ×
     hashtag_ratio（按事件原名算，翻译后的中文名不影响），最低扣到
     0 分。hashtag_penalty_max 为 None 时用默认值 30.0；传 0 关闭惩罚。
+
+    通用标题惩罚：综合分算完后减去 generic_title_penalty_max（通用
+    标题扣满，见 trend_radar/text_utils.py::is_generic_title；有实质
+    内容的标题不扣），最低扣到 0 分。两个惩罚是独立的减法，可叠加。
+    generic_title_penalty_max 为 None 时用默认值 15.0；传 0 关闭惩罚。
     """
     if not events:
         return []
@@ -261,6 +294,11 @@ def rank_events(
         DEFAULT_HASHTAG_PENALTY_MAX
         if hashtag_penalty_max is None
         else max(0.0, float(hashtag_penalty_max))
+    )
+    generic_penalty_max = (
+        DEFAULT_GENERIC_TITLE_PENALTY_MAX
+        if generic_title_penalty_max is None
+        else max(0.0, float(generic_title_penalty_max))
     )
 
     burst_by_id: dict[str, list[str]] = {}
@@ -310,11 +348,17 @@ def rank_events(
         # 算占比（翻译后的中文名不影响判定），扣分是绝对分（0-100 分
         # 制里直接减），不是乘系数：高分真事件带少量 hashtag 时只扣
         # 一点，junk 事件占比高时扣满。扣完最低 0 分。
+        # 通用标题惩罚：光秃秃的通用标题（如“突发新闻”）本身几乎没有
+        # 信息，同样是绝对分直接减（扣满 generic_penalty_max）；带通用
+        # 词但有实质内容的标题不扣。两个惩罚独立，可叠加，最低 0 分。
         tag_ratio = hashtag_ratio(ev.get("name") or "")
-        score = max(0.0, score * 100 - penalty_max * tag_ratio)
+        is_generic = is_generic_title(ev.get("name") or "")
+        generic_deduction = generic_penalty_max if is_generic else 0.0
+        score = max(0.0, score * 100 - penalty_max * tag_ratio - generic_deduction)
         out = dict(ev)
         out["rank_score"] = round(score, 1)
         out["hashtag_ratio"] = round(tag_ratio, 2)
+        out["is_generic_title"] = is_generic
         out["is_recurrence"] = is_recurrence
         out["rank_reasons"] = _rank_reasons(
             ev,
@@ -323,6 +367,7 @@ def rank_events(
             is_fastest_growth=(growth_raw[idx] > 0 and growth_raw[idx] >= max_growth),
             is_recurrence=is_recurrence,
             tag_ratio=tag_ratio,
+            is_generic=is_generic,
         )
         ranked.append(out)
     ranked.sort(key=lambda e: (-e["rank_score"], e.get("event_id") or ""))

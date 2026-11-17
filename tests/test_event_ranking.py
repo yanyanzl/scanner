@@ -263,7 +263,9 @@ class TestHashtagPenalty(unittest.TestCase):
     def test_screenshot_order_without_penalty(self):
         """惩罚关掉时，截图的顺序重现：警察局长、hashtag、小丑前 3。"""
         now, batch = _screenshot_batch()
-        ranked = rank_events(batch, now=now, hashtag_penalty_max=0)
+        ranked = rank_events(
+            batch, now=now, hashtag_penalty_max=0, generic_title_penalty_max=0
+        )
         top3 = [e["event_id"] for e in ranked[:3]]
         self.assertEqual(top3, ["evt_police", "evt_hashtag", "evt_clown"])
 
@@ -272,7 +274,7 @@ class TestHashtagPenalty(unittest.TestCase):
         警察局长（占比 0）仍是第 1；30 分下纯 hashtag 标题扣到 0 分，
         小丑剩约 9 分（20 分时分别是 8.3 和 14.2）。"""
         now, batch = _screenshot_batch()
-        ranked = rank_events(batch, now=now)
+        ranked = rank_events(batch, now=now, generic_title_penalty_max=0)
         self.assertEqual(ranked[0]["event_id"], "evt_police")
         top3 = [e["event_id"] for e in ranked[:3]]
         self.assertNotIn("evt_clown", top3)
@@ -284,8 +286,16 @@ class TestHashtagPenalty(unittest.TestCase):
     def test_penalty_proportional_to_ratio(self):
         """扣分与 hashtag 占比成正比：占比越高扣得越多。"""
         now, batch = _screenshot_batch()
-        ranked = {e["event_id"]: e for e in rank_events(batch, now=now)}
-        plain = {e["event_id"]: e for e in rank_events(batch, now=now, hashtag_penalty_max=0)}
+        ranked = {
+            e["event_id"]: e
+            for e in rank_events(batch, now=now, generic_title_penalty_max=0)
+        }
+        plain = {
+            e["event_id"]: e
+            for e in rank_events(
+                batch, now=now, hashtag_penalty_max=0, generic_title_penalty_max=0
+            )
+        }
         for eid in ("evt_hashtag", "evt_clown", "evt_musk"):
             drop = plain[eid]["rank_score"] - ranked[eid]["rank_score"]
             self.assertGreater(drop, 0)
@@ -332,6 +342,193 @@ class TestHashtagPenalty(unittest.TestCase):
         )
         self.assertIn("hashtag_penalty_max", text)
         self.assertEqual(load_ranking_config()["hashtag_penalty_max"], 30.0)
+
+
+def _screenshot_batch_1117():
+    """2026-11-17 11:45 Dashboard 截图的 Top 10 批（mock，数值取自截图）。
+
+    标题用面板上显示的中文名（同 11-16 mock 的做法）；增长与首次出现
+    取自截图的“最大增长/小时”和“首次出现”列；最高分取自截图的原因
+    栏（有显示的 6 条：#2 0.36、#6 0.33、#7 0.32、#8 0.32、#9 0.31、
+    #10 0.32）。#1 0.46、#3/#4/#5 0.315 是截图未显示的推测值，只为
+    复现顺序；total_score 截图里不显示，取与 max_score 相近的值
+    （#7 取 0.33、#10 取 0.20 微调顺序）。真实批次有几百个事件，
+    min-max 在全批里算，所以 mock 的绝对分（64.8/25.6/24.9/…）和
+    截图（64.8/23.8/22/…）不完全一样，锁的是顺序——和 11-16 mock 一样。
+
+    第 11 行 evt_filler 是为测 Top 10 边界加的填充行（中性标题，
+    分数介于 #10 与被扣后的 #3 之间）：不加它，10 行 mock 里被扣到
+    末尾仍在前 10，测不出“掉出 Top 10”。
+    """
+    now = datetime(2026, 11, 17, 11, 45, tzinfo=timezone.utc)
+
+    def ev(eid, name, growth, max_score, total_score, first_seen):
+        return {
+            "event_id": eid,
+            "name": name,
+            "name_zh": None,
+            "first_seen": first_seen,
+            "platforms": ["youtube"],
+            "platform_count": 1,
+            "item_count": 1,
+            "total_score": total_score,
+            "max_score": max_score,
+            "max_growth": growth,
+            "trend": "rising",
+            "items": [],
+        }
+
+    return now, [
+        ev("evt_delhi", "今日突发新闻|11月17日新闻 |巴巴·巴格什瓦尔 |拉姆卡塔 |阿克希莱…", 1044.58, 0.46, 0.46, "2026-11-16T10:18:00+00:00"),
+        ev("evt_agent", "人工智能代理：人工智能的下一轮进化（你需要了解的一切）", 76.38, 0.36, 0.36, "2026-11-16T12:03:00+00:00"),
+        ev("evt_breaking", "突发新闻", 81.6, 0.315, 0.315, "2026-11-17T09:54:00+00:00"),
+        ev("evt_hokoon", "突发新闻：赛义德·霍孔被捕 |审讯正在进行中", 54.75, 0.315, 0.315, "2026-11-17T09:22:00+00:00"),
+        ev("evt_iran", "[突发新闻] 伊朗反射炸弹对抗华盛顿目标？", 0, 0.315, 0.315, "2026-11-17T11:44:00+00:00"),
+        ev("evt_vargas", "最新消息！！豪尔赫·阿尔弗雷多·巴尔加斯", 49.22, 0.33, 0.33, "2026-11-16T18:53:00+00:00"),
+        ev("evt_627", "627. 针对被囚禁女性的人工智能", 57.86, 0.32, 0.33, "2026-11-16T12:03:00+00:00"),
+        ev("evt_smart", "人工智能“智能”😢🥀", 0, 0.32, 0.32, "2026-11-16T22:04:00+00:00"),
+        ev("evt_robot", "机器人与人工智能时代", 0, 0.31, 0.31, "2026-11-16T20:53:00+00:00"),
+        ev("evt_machine", "人工智能——如果我们只是机器呢？", 65.26, 0.32, 0.20, "2026-11-16T18:53:00+00:00"),
+        ev("evt_filler", "量子计算机新突破", 0, 0.30, 0.30, "2026-11-16T15:45:00+00:00"),
+    ]
+
+
+class TestGenericTitlePenalty(unittest.TestCase):
+    def test_screenshot_order_without_penalty(self):
+        """两个惩罚都关掉时，截图的 Top 10 顺序重现（填充行第 11）。"""
+        now, batch = _screenshot_batch_1117()
+        ranked = rank_events(
+            batch, now=now, hashtag_penalty_max=0, generic_title_penalty_max=0
+        )
+        top10 = [e["event_id"] for e in ranked[:10]]
+        self.assertEqual(
+            top10,
+            [
+                "evt_delhi",
+                "evt_agent",
+                "evt_breaking",
+                "evt_hokoon",
+                "evt_iran",
+                "evt_vargas",
+                "evt_627",
+                "evt_smart",
+                "evt_robot",
+                "evt_machine",
+            ],
+        )
+        self.assertEqual(ranked[10]["event_id"], "evt_filler")
+
+    def test_breaking_drops_out_of_top10(self):
+        """默认通用惩罚（上限 15 分）：光秃秃的“突发新闻”24.9 → 约 9.9，
+        掉出 Top 10；#1 不变；#4/#5/#6 带通用词但有实质内容，一分不扣。"""
+        now, batch = _screenshot_batch_1117()
+        ranked = rank_events(batch, now=now, hashtag_penalty_max=0)
+        by_id = {e["event_id"]: e for e in ranked}
+        plain = {
+            e["event_id"]: e
+            for e in rank_events(
+                batch, now=now, hashtag_penalty_max=0, generic_title_penalty_max=0
+            )
+        }
+        self.assertEqual(ranked[0]["event_id"], "evt_delhi")
+        self.assertEqual(by_id["evt_delhi"]["rank_score"], 64.8)
+        top10 = [e["event_id"] for e in ranked[:10]]
+        self.assertNotIn("evt_breaking", top10)
+        self.assertEqual(ranked[-1]["event_id"], "evt_breaking")
+        self.assertAlmostEqual(by_id["evt_breaking"]["rank_score"], 9.9, delta=0.2)
+        self.assertAlmostEqual(
+            plain["evt_breaking"]["rank_score"]
+            - by_id["evt_breaking"]["rank_score"],
+            15.0,
+            delta=0.2,
+        )
+        for eid in ("evt_hokoon", "evt_iran", "evt_vargas"):
+            self.assertEqual(
+                by_id[eid]["rank_score"], plain[eid]["rank_score"]
+            )
+            self.assertFalse(by_id[eid]["is_generic_title"])
+        self.assertTrue(by_id["evt_breaking"]["is_generic_title"])
+        self.assertIn("通用标题", by_id["evt_breaking"]["rank_reasons"])
+        self.assertNotIn("通用标题", by_id["evt_hokoon"]["rank_reasons"])
+
+    def test_generic_title_boundaries(self):
+        """判定边界：去掉通用词后一个字母都不剩才算通用。"""
+        from trend_radar.text_utils import is_generic_title
+
+        generic = [
+            "突发新闻",
+            "突发新闻！！",
+            "最新消息！！",
+            "今日头条",
+            "Breaking News",
+            "breaking news",
+            "LATEST NEWS",
+            "JUST IN",
+            "【突发新闻】",
+            "",
+            "突发新闻 1",
+        ]
+        for title in generic:
+            self.assertTrue(is_generic_title(title), title)
+        not_generic = [
+            "突发新闻：赛义德·霍孔被捕",
+            "[突发新闻] 伊朗反射炸弹对抗华盛顿目标？",
+            "最新消息！！豪尔赫·阿尔弗雷多·巴尔加斯",
+            "Breaking News: X",
+            "JUST IN: 市场大跌",
+            "突发新闻 A",
+            "今日突发新闻|11月17日新闻 |巴巴·巴格什瓦尔",
+            "人工智能——如果我们只是机器呢？",
+        ]
+        for title in not_generic:
+            self.assertFalse(is_generic_title(title), title)
+
+    def test_penalties_stack(self):
+        """两个惩罚可叠加：既通用又 hashtag 重的标题，两项都扣（最低 0 分）。"""
+        a = _ev("evt_plain", first_seen_hours_ago=1.0, name="普通事件")
+        b = _ev(
+            "evt_stacked",
+            first_seen_hours_ago=1.0,
+            name="突发新闻 #breaking #news #live",
+        )
+        ranked = {e["event_id"]: e for e in rank_events([a, b], now=NOW)}
+        plain = {
+            e["event_id"]: e
+            for e in rank_events(
+                [a, b], now=NOW, hashtag_penalty_max=0, generic_title_penalty_max=0
+            )
+        }
+        stacked = ranked["evt_stacked"]
+        self.assertTrue(stacked["is_generic_title"])
+        self.assertAlmostEqual(stacked["hashtag_ratio"], 0.83, places=2)
+        drop = plain["evt_stacked"]["rank_score"] - stacked["rank_score"]
+        # hashtag 扣 30×0.83 ≈ 24.8，通用再扣 15，共约 39.8。
+        self.assertAlmostEqual(drop, 30.0 * 0.83 + 15.0, delta=0.5)
+        # 对照：只通用不带 hashtag 的标题，恰好扣 15 分。
+        c = _ev("evt_generic_only", first_seen_hours_ago=1.0, name="突发新闻")
+        only = {e["event_id"]: e for e in rank_events([a, c], now=NOW)}
+        only_plain = {
+            e["event_id"]: e
+            for e in rank_events(
+                [a, c], now=NOW, hashtag_penalty_max=0, generic_title_penalty_max=0
+            )
+        }
+        self.assertAlmostEqual(
+            only_plain["evt_generic_only"]["rank_score"]
+            - only["evt_generic_only"]["rank_score"],
+            15.0,
+            delta=0.2,
+        )
+
+    def test_config_file_has_generic_penalty_key(self):
+        """config.yaml 里有 ranking.generic_title_penalty_max（默认 15.0）。"""
+        from trend_radar.event_ranking import load_ranking_config
+
+        text = (Path(__file__).resolve().parent.parent / "config.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("generic_title_penalty_max", text)
+        self.assertEqual(load_ranking_config()["generic_title_penalty_max"], 15.0)
 
 
 if __name__ == "__main__":

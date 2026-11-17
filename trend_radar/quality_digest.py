@@ -9,7 +9,7 @@ Cheese 在对话里做（或经用户确认后做）。
 当地时间，与报告期日期不同）；Top 5 事件（当前综合排名）；
 昨日计数（事件数、爆发数、被抑制的重复出现数、Telegram 已发、
 Muse 已发/失败）；质量信号（Top 10 里单平台事件数、hashtag 占比
-高的事件数、recurrence 事件数）。
+高的事件数、recurrence 事件数、通用标题数）。
 
 标记：第一行是【质量简报｜quality-digest v1｜date=YYYY-MM-DD】，
 与爆发提醒的 scanner-alert 标记区分开——parse_scanner_marker
@@ -224,8 +224,8 @@ def format_quality_digest(data: dict) -> str:
 
     data 是 gather_digest_data 的返回值。Top 5 取 top_events 的前 5
     条（当前综合排名）；质量信号对整个 Top 10 列表算（单平台数、
-    hashtag 占比 >= 0.5 的事件数、recurrence 事件数）。计数缺失时
-    写“昨日无轮次记录”，Top 10 为空时质量信号写“暂无数据”。
+    hashtag 占比 >= 0.5 的事件数、recurrence 事件数、通用标题数）。
+    计数缺失时写“昨日无轮次记录”，Top 10 为空时质量信号写“暂无数据”。
     data 里有 generated_at 时在标题行后加一行生成时间（本机当地
     时间，见 gather_digest_data）；没有时不写这一行。
     """
@@ -274,9 +274,11 @@ def format_quality_digest(data: dict) -> str:
             if float(e.get("hashtag_ratio") or 0) >= HASHTAG_HIGH_RATIO
         )
         rec = sum(1 for e in top_events if e.get("is_recurrence"))
+        generic = sum(1 for e in top_events if e.get("is_generic_title"))
         lines.append(
             f"质量信号（Top {len(top_events)}）：单平台{single}个"
             f"，hashtag占比高{tag_high}个，recurrence {rec}个"
+            f"，通用标题{generic}个"
         )
     else:
         lines.append("质量信号：暂无 Top 10 数据")

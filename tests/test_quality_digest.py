@@ -104,8 +104,8 @@ class TestFormatDigest(unittest.TestCase):
         self.assertIn("重复出现被抑制7个", text)
         self.assertIn("Telegram已发3条", text)
         self.assertIn("Muse已发3条、失败1条", text)
-        # 质量信号：4 条里单平台 3 个、hashtag 高 1 个、recurrence 1 个。
-        self.assertIn("质量信号（Top 4）：单平台3个，hashtag占比高1个，recurrence 1个", text)
+        # 质量信号：4 条里单平台 3 个、hashtag 高 1 个、recurrence 1 个、通用标题 0 个。
+        self.assertIn("质量信号（Top 4）：单平台3个，hashtag占比高1个，recurrence 1个，通用标题0个", text)
         # 紧凑：不超过 1000 字符。
         self.assertLessEqual(len(text), 1000)
 

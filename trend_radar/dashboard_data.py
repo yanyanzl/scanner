@@ -310,6 +310,7 @@ def load_top_events(db_path: str | Path, limit: int | None = None) -> list[dict]
             weights=cfg.get("weights"),
             freshness_half_life_hours=cfg.get("freshness_half_life_hours"),
             hashtag_penalty_max=cfg.get("hashtag_penalty_max"),
+            generic_title_penalty_max=cfg.get("generic_title_penalty_max"),
         )
         for ev in ranked:
             name_zh = (ev.get("name_zh") or "").strip()
