@@ -105,7 +105,9 @@ ranking:
 `hashtag_penalty_max × hashtag_ratio`，下限 0 分。hashtag_ratio 是
 事件原名里 hashtag 字符占的比例（`trend_radar/text_utils.py`，与
 翻译模块共用同一份 token 判定逻辑）：纯 hashtag 标题为 1.0，
-无 hashtag 为 0.0。默认上限 20.0，可在 config.yaml
+无 hashtag 为 0.0。默认上限 30.0（2026-11-17 从 20.0 提到 30.0：
+11-16 简报里 hashtag 高的事件从 1 个变 2 个，20 分不够把它们压出
+Top 5），可在 config.yaml
 `ranking.hashtag_penalty_max` 里调，传 0 关闭惩罚；输出里同时带
 `hashtag_ratio` 字段，占比 ≥ 0.2 时原因里写出“hashtag 占比 X%”。
 
@@ -116,16 +118,17 @@ junk 被压下去，junk 的水平还能继续被每日质量简报里的质量�
 
 截图批的实测（mock，见 `tests/test_event_ranking.py` 的
 TestHashtagPenalty）：未惩罚时前 3 是警察局长 69.5、hashtag 标题
-27.0、小丑 24.3；默认惩罚 20 后警察局长 69.5 仍是第 1，小丑掉到
-第 6（14.2 分），纯 hashtag 标题掉到第 8（8.3 分）。
+27.0、小丑 24.3；默认惩罚 30 后警察局长 69.5 仍是第 1，小丑剩
+9.0 分，纯 hashtag 标题扣到 0 分（20 分时分别是 14.2 和 8.3）。
 
 recurrence 事件不追加扣分：recurrence 在排名里已经是爆发分 0 +
 新鲜度 0（最多约 27.5 分的损失），截图当晚的直播事件已不在
 Top 10 里，说明现有压制够用。
 
-校准时顺带看：惩罚上限 20 是初始假设。如果 hashtag 标题仍常进
-前 5，把上限调大；如果正常标题（带一两个标签的真新闻）被误伤，
-把上限调小。
+校准时顺带看：惩罚上限 30 是初始假设（2026-11-17 从 20 提到 30，
+因为 11-16 简报里 hashtag 高的事件从 1 个变 2 个）。如果 hashtag
+标题仍常进前 5，把上限调大；如果正常标题（带一两个标签的真新闻）
+被误伤，把上限调小。
 
 ## 校准时先看什么
 

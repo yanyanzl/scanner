@@ -268,14 +268,18 @@ class TestHashtagPenalty(unittest.TestCase):
         self.assertEqual(top3, ["evt_police", "evt_hashtag", "evt_clown"])
 
     def test_hashtag_and_clown_drop_out_of_top3(self):
-        """默认惩罚（上限 20 分）：小丑与纯 hashtag 标题掉出前 3，
-        警察局长（占比 0）仍是第 1。"""
+        """默认惩罚（上限 30 分）：小丑与纯 hashtag 标题掉出前 3，
+        警察局长（占比 0）仍是第 1；30 分下纯 hashtag 标题扣到 0 分，
+        小丑剩约 9 分（20 分时分别是 8.3 和 14.2）。"""
         now, batch = _screenshot_batch()
         ranked = rank_events(batch, now=now)
         self.assertEqual(ranked[0]["event_id"], "evt_police")
         top3 = [e["event_id"] for e in ranked[:3]]
         self.assertNotIn("evt_clown", top3)
         self.assertNotIn("evt_hashtag", top3)
+        by_id = {e["event_id"]: e for e in ranked}
+        self.assertEqual(by_id["evt_hashtag"]["rank_score"], 0.0)
+        self.assertAlmostEqual(by_id["evt_clown"]["rank_score"], 9.0, delta=0.2)
 
     def test_penalty_proportional_to_ratio(self):
         """扣分与 hashtag 占比成正比：占比越高扣得越多。"""
@@ -285,9 +289,12 @@ class TestHashtagPenalty(unittest.TestCase):
         for eid in ("evt_hashtag", "evt_clown", "evt_musk"):
             drop = plain[eid]["rank_score"] - ranked[eid]["rank_score"]
             self.assertGreater(drop, 0)
-            # rank_score 输出只保留 1 位小数，差值与 20×占比允许 0.2 误差。
+            # rank_score 输出只保留 1 位小数，差值与 30×占比允许 0.2 误差；
+            # 扣分超过原分时下限 0 截断，差值就是原分本身。
             self.assertAlmostEqual(
-                drop, 20.0 * ranked[eid]["hashtag_ratio"], delta=0.2
+                drop,
+                min(30.0 * ranked[eid]["hashtag_ratio"], plain[eid]["rank_score"]),
+                delta=0.2,
             )
         # 占比 0 的警察局长一分不扣。
         self.assertEqual(
@@ -317,14 +324,14 @@ class TestHashtagPenalty(unittest.TestCase):
         )
 
     def test_config_file_has_penalty_key(self):
-        """config.yaml 里有 ranking.hashtag_penalty_max（默认 20.0）。"""
+        """config.yaml 里有 ranking.hashtag_penalty_max（默认 30.0）。"""
         from trend_radar.event_ranking import load_ranking_config
 
         text = (Path(__file__).resolve().parent.parent / "config.yaml").read_text(
             encoding="utf-8"
         )
         self.assertIn("hashtag_penalty_max", text)
-        self.assertEqual(load_ranking_config()["hashtag_penalty_max"], 20.0)
+        self.assertEqual(load_ranking_config()["hashtag_penalty_max"], 30.0)
 
 
 if __name__ == "__main__":
