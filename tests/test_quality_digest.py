@@ -15,8 +15,10 @@ from trend_radar.quality_digest import (
     gather_digest_data,
     is_quality_digest,
     load_digest_config,
+    load_pending_digest,
     parse_quality_digest,
     record_round_counts,
+    retry_pending_digest,
     send_quality_digest,
 )
 
@@ -302,6 +304,134 @@ class TestSendDigest(unittest.TestCase):
                 self.assertIn(result["reason"], ("no_data", "no_muse_tab"))
         finally:
             mc.send_to_muse_chat = orig_send
+
+
+class TestDigestPendingRetry(unittest.TestCase):
+    """发送失败记待补发、每轮重发、成功清除、过期丢弃（2026-11-18 教训）。
+
+    昨天有轮次计数（record_round_counts）时发送才会被真正尝试；
+    空库无计数会先以 no_data 跳过，不调发送、也不记待补发。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.tmp.name)
+        self.db_path = self.data_dir / "trends.sqlite3"
+        dbmod.connect(self.db_path).close()
+        self.yesterday = (datetime.now() - timedelta(days=1)).date().isoformat()
+        record_round_counts(self.db_path, {"bursts": 1}, today=self.yesterday)
+        self.cfg = {
+            "db_path": str(self.db_path),
+            "muse_chat": {"enabled": True},
+            "quality_digest": {"enabled": True},
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _patch_send(self, result):
+        import trend_radar.muse_chat as mc
+
+        orig_send = mc.send_to_muse_chat
+        calls = []
+        mc.send_to_muse_chat = lambda text, cfg: calls.append(text) or result
+        return orig_send, calls
+
+    def _restore_send(self, orig_send):
+        import trend_radar.muse_chat as mc
+
+        mc.send_to_muse_chat = orig_send
+
+    def test_send_failure_marks_pending(self):
+        orig_send, _ = self._patch_send({"ok": False, "reason": "no_muse_tab"})
+        try:
+            result = send_quality_digest(self.cfg)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["reason"], "no_muse_tab")
+            self.assertEqual(load_pending_digest(self.db_path), self.yesterday)
+        finally:
+            self._restore_send(orig_send)
+
+    def test_retry_sends_when_tab_back_and_clears(self):
+        orig_send, _ = self._patch_send({"ok": False, "reason": "no_muse_tab"})
+        try:
+            send_quality_digest(self.cfg)
+            self.assertEqual(load_pending_digest(self.db_path), self.yesterday)
+        finally:
+            self._restore_send(orig_send)
+        orig_send, calls = self._patch_send({"ok": True})
+        try:
+            result = retry_pending_digest(self.cfg)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["date"], self.yesterday)
+            self.assertEqual(len(calls), 1)
+            self.assertIsNone(load_pending_digest(self.db_path))
+            # 没有待补发时不再调发送。
+            result = retry_pending_digest(self.cfg)
+            self.assertEqual(result["reason"], "no_pending")
+            self.assertEqual(len(calls), 1)
+        finally:
+            self._restore_send(orig_send)
+
+    def test_retry_keeps_pending_on_repeated_failure(self):
+        orig_send, _ = self._patch_send({"ok": False, "reason": "no_muse_tab"})
+        try:
+            send_quality_digest(self.cfg)
+            result = retry_pending_digest(self.cfg)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["reason"], "no_muse_tab")
+            self.assertEqual(load_pending_digest(self.db_path), self.yesterday)
+        finally:
+            self._restore_send(orig_send)
+
+    def test_send_success_clears_older_pending(self):
+        (self.data_dir / ".digest_pending.json").write_text(
+            json.dumps({"date": self.yesterday}), encoding="utf-8"
+        )
+        orig_send, _ = self._patch_send({"ok": True})
+        try:
+            result = send_quality_digest(self.cfg)
+            self.assertTrue(result["ok"])
+            self.assertIsNone(load_pending_digest(self.db_path))
+        finally:
+            self._restore_send(orig_send)
+
+    def test_stale_pending_dropped_without_sending(self):
+        stale = (datetime.now() - timedelta(days=3)).date().isoformat()
+        (self.data_dir / ".digest_pending.json").write_text(
+            json.dumps({"date": stale}), encoding="utf-8"
+        )
+        orig_send, calls = self._patch_send({"ok": True})
+        try:
+            result = retry_pending_digest(self.cfg)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["reason"], "pending_stale")
+            self.assertEqual(calls, [])
+            self.assertIsNone(load_pending_digest(self.db_path))
+        finally:
+            self._restore_send(orig_send)
+
+    def test_no_data_does_not_mark_pending(self):
+        # 昨天无计数、无事件：发送前以 no_data 跳过，不记待补发。
+        with tempfile.TemporaryDirectory() as d:
+            db_path = Path(d) / "trends.sqlite3"
+            dbmod.connect(db_path).close()
+            orig_send, calls = self._patch_send(
+                {"ok": False, "reason": "no_muse_tab"}
+            )
+            try:
+                result = send_quality_digest(
+                    {
+                        "db_path": str(db_path),
+                        "muse_chat": {"enabled": True},
+                        "quality_digest": {"enabled": True},
+                    }
+                )
+                self.assertEqual(result["reason"], "no_data")
+                self.assertEqual(calls, [])
+                self.assertIsNone(load_pending_digest(db_path))
+            finally:
+                self._restore_send(orig_send)
 
 
 if __name__ == "__main__":

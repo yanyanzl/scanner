@@ -3,6 +3,9 @@
 先立即跑一轮，再按间隔执行。电脑睡着时 15 分钟轮次会跳过、醒来
 恢复；每日质量简报有 12 小时补发宽限（见
 DIGEST_MISFIRE_GRACE_SECONDS），睡过 8 点也不会丢掉当天那份。
+宽限只保证任务触发：如果 8 点触发后发送失败（比如 Safari 里没有
+Muse 对话标签页），那份简报记进 data/.digest_pending.json，由每轮
+采集顺带重发（见 trend_radar/quality_digest.retry_pending_digest）。
 
 单次扫描模式（用于命令行冒烟测试和 GitHub Actions）：
     python run_scheduler.py --once

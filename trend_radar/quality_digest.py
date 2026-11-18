@@ -21,6 +21,14 @@ data/.quality_daily.json（按本地日期分桶，只保留昨天和今天）�
 聚类里 first_seen 落在昨天的事件数）。发送走 muse_chat 已有的
 通用发送路径（send_to_muse_chat），不另写 AppleScript/CDP。
 发送失败只记 warning，不影响扫描轮次；muse_chat 没启用时跳过。
+
+发送失败的补发（2026-11-18 教训）：08:00 那份简报的任务触发了，
+12 小时宽限也起了作用，但 Safari 里没有 Muse 对话标签页
+（no_muse_tab），发送失败、当天那份就丢了——宽限只保证任务触发，
+不保证发送成功。所以发送失败时把日期记进 data/.digest_pending.json，
+之后每轮采集（collect_once）顺带重发一次，直到成功或过期。
+过期：待发日期早于昨天（即次日 08:00 的新简报已接替）就丢弃，
+不积压；生成时间行写的是实际重发时间，不造假。
 """
 from __future__ import annotations
 
@@ -42,6 +50,7 @@ _DIGEST_MARKER_RE = re.compile(
 )
 
 DIGEST_STATE_FILENAME = ".quality_daily.json"
+DIGEST_PENDING_FILENAME = ".digest_pending.json"
 DEFAULT_DIGEST_HOUR = 8
 DIGEST_MAX_CHARS = 1000
 HASHTAG_HIGH_RATIO = 0.5
@@ -134,6 +143,56 @@ def _save_daily_state(db_path: str | Path, state: dict) -> bool:
         return True
     except Exception:
         return False
+
+
+def _pending_path(db_path: str | Path) -> Path:
+    return Path(db_path).parent / DIGEST_PENDING_FILENAME
+
+
+def load_pending_digest(db_path: str | Path) -> str | None:
+    """读待补发的简报日期（data/.digest_pending.json 里 {"date": ...}）。
+
+    文件缺失/损坏/日期不是 YYYY-MM-DD 格式时返回 None（不抛异常）。
+    """
+    try:
+        data = json.loads(_pending_path(db_path).read_text(encoding="utf-8"))
+        date = data.get("date") if isinstance(data, dict) else None
+        if isinstance(date, str) and len(date) == 10 and date[4] == "-" and date[7] == "-":
+            return date
+    except Exception:
+        pass
+    return None
+
+
+def _save_pending_digest(db_path: str | Path, date: str) -> bool:
+    """把某天的简报记为待补发（原子写）；失败返回 False。"""
+    try:
+        path = _pending_path(db_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps({"date": date}, ensure_ascii=False), encoding="utf-8"
+        )
+        tmp.replace(path)
+        return True
+    except Exception:
+        return False
+
+
+def _clear_pending_digest(db_path: str | Path) -> bool:
+    """清除待补发记录（文件不存在也算成功）；失败返回 False。"""
+    try:
+        _pending_path(db_path).unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _db_path_for_config(cfg: dict) -> Path:
+    db_path = Path(cfg.get("db_path", "data/trends.sqlite3"))
+    if not db_path.is_absolute():
+        db_path = BASE_DIR / db_path
+    return db_path
 
 
 def record_round_counts(
@@ -285,12 +344,36 @@ def format_quality_digest(data: dict) -> str:
     return "\n".join(lines)
 
 
-def send_quality_digest(config: dict | None = None) -> dict:
+def _send_digest_for_date(cfg: dict, db_path: str | Path, date: str) -> dict:
+    """为指定日期汇总并发送一份简报（不碰待补发记录）。
+
+    返回 {"ok": bool, "date": ..., "reason": ...}；无数据时 reason
+    为 no_data（调用方不把这种情况记为待补发）。
+    """
+    data = gather_digest_data(db_path, date=date)
+    if not data["top_events"] and data["counts"] is None:
+        logger.info("每日质量简报跳过：%s 无数据（扫描器可能未运行）", date)
+        return {"ok": False, "date": date, "reason": "no_data"}
+    from trend_radar.muse_chat import send_to_muse_chat
+
+    muse_cfg = cfg.get("muse_chat") or {}
+    result = send_to_muse_chat(format_quality_digest(data), muse_cfg)
+    if result.get("ok"):
+        logger.info("每日质量简报已发送（%s）", date)
+        return {"ok": True, "date": date}
+    logger.warning("每日质量简报发送失败（%s）：%s", date, result.get("reason"))
+    return {"ok": False, "date": date, "reason": result.get("reason", "unknown")}
+
+
+def send_quality_digest(config: dict | None = None, date: str | None = None) -> dict:
     """构建昨日质量简报并打进 Muse 对话。返回 {"ok": bool, "reason": ...}。
 
     quality_digest.enabled 为 false、或 muse_chat 未启用、或昨日
     完全无数据时跳过（不发、不报错）。发送失败只记 warning，绝不
-    抛异常、不影响扫描轮次。
+    抛异常、不影响扫描轮次；但失败的日期会记为待补发
+    （data/.digest_pending.json），由每轮采集顺带重发——2026-11-18
+    那份就是这样丢的：任务触发了，Safari 里没标签页发不出去。
+    date 仅供单测/手动指定报告期，正常调用不传（默认昨天）。
     """
     cfg = config or {}
     try:
@@ -300,21 +383,50 @@ def send_quality_digest(config: dict | None = None) -> dict:
         if not muse_cfg.get("enabled", True):
             logger.info("每日质量简报跳过：muse_chat 未启用")
             return {"ok": False, "reason": "muse_chat_disabled"}
-        db_path = Path(cfg.get("db_path", "data/trends.sqlite3"))
-        if not db_path.is_absolute():
-            db_path = BASE_DIR / db_path
-        data = gather_digest_data(db_path)
-        if not data["top_events"] and data["counts"] is None:
-            logger.info("每日质量简报跳过：昨日无数据（扫描器可能未运行）")
-            return {"ok": False, "reason": "no_data"}
-        from trend_radar.muse_chat import send_to_muse_chat
-
-        result = send_to_muse_chat(format_quality_digest(data), muse_cfg)
+        db_path = _db_path_for_config(cfg)
+        day = date or _yesterday()
+        result = _send_digest_for_date(cfg, db_path, day)
         if result.get("ok"):
-            logger.info("每日质量简报已发送（%s）", data["date"])
-            return {"ok": True, "date": data["date"]}
-        logger.warning("每日质量简报发送失败：%s", result.get("reason"))
-        return {"ok": False, "reason": result.get("reason", "unknown")}
+            pending = load_pending_digest(db_path)
+            if pending is not None and pending <= day:
+                _clear_pending_digest(db_path)
+            return result
+        if result.get("reason") != "no_data":
+            _save_pending_digest(db_path, day)
+        return result
     except Exception as exc:  # 简报失败不影响扫描轮次
         logger.warning("每日质量简报异常（不影响扫描）: %s", exc)
+        return {"ok": False, "reason": str(exc)}
+
+
+def retry_pending_digest(config: dict | None = None) -> dict:
+    """重发待补发的质量简报（由 collect_once 每轮结束后调用一次）。
+
+    没有待补发记录时直接返回 no_pending，不调发送、不碰 Safari。
+    待发日期早于昨天时视为过期：清除记录、不发送（次日 08:00 的
+    新简报已接替，不积压）。发送成功清除记录；再失败则保留记录，
+    下一轮继续试。任何异常都不抛给调用方。
+    """
+    cfg = config or {}
+    try:
+        if not load_digest_config(cfg).get("enabled", True):
+            return {"ok": False, "reason": "digest_disabled"}
+        muse_cfg = cfg.get("muse_chat") or {}
+        if not muse_cfg.get("enabled", True):
+            return {"ok": False, "reason": "muse_chat_disabled"}
+        db_path = _db_path_for_config(cfg)
+        pending = load_pending_digest(db_path)
+        if pending is None:
+            return {"ok": False, "reason": "no_pending"}
+        today = datetime.now().date().isoformat()
+        if pending < _yesterday() or pending > today:
+            logger.info("待补发简报已过期（%s），丢弃", pending)
+            _clear_pending_digest(db_path)
+            return {"ok": False, "date": pending, "reason": "pending_stale"}
+        result = _send_digest_for_date(cfg, db_path, pending)
+        if result.get("ok"):
+            _clear_pending_digest(db_path)
+        return result
+    except Exception as exc:  # 补发失败不影响扫描轮次
+        logger.warning("质量简报补发异常（不影响扫描）: %s", exc)
         return {"ok": False, "reason": str(exc)}

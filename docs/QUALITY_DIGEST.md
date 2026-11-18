@@ -44,6 +44,12 @@ token）；识别用 `trend_radar/quality_digest.py` 里的
   （走同一条发送通道）。
 - 失败只记 warning：发送失败、没数据、muse_chat 未启用时都不抛异常，
   绝不影响扫描轮次。
+- 发送失败会补发：08:00 发送失败（如 Safari 里没有 Muse 对话标签页，
+  `no_muse_tab`）时，日期记进本地 `data/.digest_pending.json`；
+  `collect_once` 每轮末尾调 `retry_pending_digest` 重发一次，直到成功
+  或过期（待发日期早于昨天就丢弃，次日 08:00 的新简报接替，不积压）。
+  注意 12 小时宽限只保证任务触发，不保证发送成功——2026-11-18 那份
+  就是任务触发了但发送失败丢掉的，靠这个补发机制兜底。
 
 ## 实现
 

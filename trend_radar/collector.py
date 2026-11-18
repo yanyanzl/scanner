@@ -813,6 +813,18 @@ def collect_once(config: dict | None = None, config_path: Path | None = None) ->
     except Exception as exc:
         logger.warning("质量简报计数记录失败（不影响采集）: %s", exc)
 
+    # 待补发的质量简报：今早 08:00 发送失败（如 Safari 里没有 Muse
+    # 对话标签页，no_muse_tab）会记在 data/.digest_pending.json 里，
+    # 每轮顺带重发一次，直到成功或过期；没有待补发时直接返回，
+    # 不调发送。2026-11-18 那份就是这样丢的——宽限只保证任务触发，
+    # 不保证发送成功。
+    try:
+        from trend_radar.quality_digest import retry_pending_digest
+
+        retry_pending_digest(cfg)
+    except Exception as exc:
+        logger.warning("质量简报补发检查失败（不影响采集）: %s", exc)
+
     counts["saved"] = saved
     logger.info("本轮采集完成: %s", counts)
     return counts
