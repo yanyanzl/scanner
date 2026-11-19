@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 MARKER_VERSION = "v1"
 
 DEFAULT_URL_MATCH = "muse.ai"
+DEFAULT_URL_EXCLUDE = ""
 DEFAULT_CDP_PORT = 9222
 # 两条提醒之间隔多久（别连打两条把输入框打架了）。
 MESSAGE_DELAY_SECONDS = 0.5
@@ -326,11 +327,16 @@ def build_js_payload(text: str) -> str:
 APPLESCRIPT_TEMPLATE = """on run argv
   set jsPath to item 1 of argv
   set urlMatch to item 2 of argv
+  set urlExclude to item 3 of argv
   set jsCode to read POSIX file jsPath as «class utf8»
   if application "Google Chrome" is not running then
     return "NO_CHROME"
   end if
   tell application "Google Chrome"
+    -- urlExclude：排除含这串的标签页（2026-11-19：主对话地址是裸域名
+    -- https://muse.ai，侧边对话是 /thread/<id>，只靠 urlMatch 分不出；
+    -- 填 "/thread/" 就只发主对话。空串不排除——AppleScript 里 "" 会被
+    -- 任何字符串 contains，所以空串时必须显式跳过排除检查）。
     -- 注意：必须用“tab ti of window wi”这种显式序号定位标签页。
     -- 把循环变量直接传给 execute javascript 会报 -1700
     -- （Can't make application "Google Chrome" into type
@@ -338,7 +344,9 @@ APPLESCRIPT_TEMPLATE = """on run argv
     repeat with wi from 1 to count of windows
       repeat with ti from 1 to count of tabs of window wi
         if (URL of tab ti of window wi) contains urlMatch then
-          return execute javascript jsCode in tab ti of window wi
+          if urlExclude is "" or (URL of tab ti of window wi) does not contain urlExclude then
+            return execute javascript jsCode in tab ti of window wi
+          end if
         end if
       end repeat
     end repeat
@@ -358,6 +366,7 @@ end run
 SAFARI_APPLESCRIPT_TEMPLATE = """on run argv
   set jsPath to item 1 of argv
   set urlMatch to item 2 of argv
+  set urlExclude to item 3 of argv
   set jsCode to read POSIX file jsPath as «class utf8»
   if application "Safari" is not running then
     return "NO_SAFARI"
@@ -378,18 +387,22 @@ SAFARI_APPLESCRIPT_TEMPLATE = """on run argv
     try
       set curTab to current tab of window 1
       if (URL of curTab) contains urlMatch then
-        set current tab of window 1 to curTab
-        delay 0.5
-        return do JavaScript jsCode in curTab
+        if urlExclude is "" or (URL of curTab) does not contain urlExclude then
+          set current tab of window 1 to curTab
+          delay 0.5
+          return do JavaScript jsCode in curTab
+        end if
       end if
     end try
     -- 同样用显式序号定位标签页（与 Chrome 模板同理）。
     repeat with wi from 1 to count of windows
       repeat with ti from 1 to count of tabs of window wi
         if (URL of tab ti of window wi) contains urlMatch then
-          set current tab of window wi to tab ti of window wi
-          delay 0.5
-          return do JavaScript jsCode in tab ti of window wi
+          if urlExclude is "" or (URL of tab ti of window wi) does not contain urlExclude then
+            set current tab of window wi to tab ti of window wi
+            delay 0.5
+            return do JavaScript jsCode in tab ti of window wi
+          end if
         end if
       end repeat
     end repeat
@@ -450,7 +463,7 @@ def _looks_like_safari_js_blocked(stderr: str) -> bool:
     )
 
 
-def _send_via_applescript(text: str, url_match: str) -> dict:
+def _send_via_applescript(text: str, url_match: str, url_exclude: str = "") -> dict:
     """macOS：osascript 找 Chrome 里含 url_match 的标签页，执行 JS。"""
     js = build_js_payload(text)
     try:
@@ -460,7 +473,7 @@ def _send_via_applescript(text: str, url_match: str) -> dict:
             js_path.write_text(js, encoding="utf-8")
             scpt_path.write_text(APPLESCRIPT_TEMPLATE, encoding="utf-8")
             proc = subprocess.run(
-                ["osascript", str(scpt_path), str(js_path), url_match],
+                ["osascript", str(scpt_path), str(js_path), url_match, url_exclude],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -495,7 +508,7 @@ def _send_via_applescript(text: str, url_match: str) -> dict:
     return {"ok": False, "reason": reason, "detail": str(result)[:200]}
 
 
-def _send_via_safari(text: str, url_match: str) -> dict:
+def _send_via_safari(text: str, url_match: str, url_exclude: str = "") -> dict:
     """macOS：osascript 找 Safari 里含 url_match 的标签页，执行 JS。
 
     与 _send_via_applescript 同一套流程（临时文件 + osascript +
@@ -510,7 +523,7 @@ def _send_via_safari(text: str, url_match: str) -> dict:
             js_path.write_text(js, encoding="utf-8")
             scpt_path.write_text(SAFARI_APPLESCRIPT_TEMPLATE, encoding="utf-8")
             proc = subprocess.run(
-                ["osascript", str(scpt_path), str(js_path), url_match],
+                ["osascript", str(scpt_path), str(js_path), url_match, url_exclude],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -548,7 +561,7 @@ def _send_via_safari(text: str, url_match: str) -> dict:
 # ---------------------------------------------------------------------------
 # Windows：CDP。websocket-client 只在这里懒加载，macOS 永远不需要它。
 # ---------------------------------------------------------------------------
-def _send_via_cdp(text: str, url_match: str, port: int = DEFAULT_CDP_PORT) -> dict:
+def _send_via_cdp(text: str, url_match: str, port: int = DEFAULT_CDP_PORT, url_exclude: str = "") -> dict:
     """Windows：连 Chrome 调试端口，找含 url_match 的页面 target，
     用 Runtime.evaluate 执行 JS。"""
     try:
@@ -560,7 +573,11 @@ def _send_via_cdp(text: str, url_match: str, port: int = DEFAULT_CDP_PORT) -> di
         return {"ok": False, "reason": "cdp_bad_response", "detail": str(exc)[:200]}
     target = None
     for candidate in targets or []:
-        if candidate.get("type") == "page" and url_match in (candidate.get("url") or ""):
+        if (
+            candidate.get("type") == "page"
+            and url_match in (candidate.get("url") or "")
+            and (not url_exclude or url_exclude not in (candidate.get("url") or ""))
+        ):
             target = candidate
             break
     if target is None:
@@ -662,20 +679,21 @@ def send_to_muse_chat(text: str, muse_cfg: dict | None = None) -> dict:
     "reason": ...}，reason 只在失败时有。任何失败都不抛异常。"""
     cfg = muse_cfg or {}
     url_match = (cfg.get("url_match") or DEFAULT_URL_MATCH).strip() or DEFAULT_URL_MATCH
+    url_exclude = (cfg.get("url_exclude") or "").strip()
     method = _resolve_method(cfg.get("method", "auto"))
     if method == "unsupported":
         logger.info("Muse 对话提醒跳过：当前平台 %s 不支持浏览器输入（仅 macOS/Windows）", sys.platform)
         return {"ok": False, "reason": "unsupported_platform"}
     if method == "applescript":
-        result = _send_via_applescript(text, url_match)
+        result = _send_via_applescript(text, url_match, url_exclude)
     elif method == "safari":
-        result = _send_via_safari(text, url_match)
+        result = _send_via_safari(text, url_match, url_exclude)
     else:
         try:
             port = int(cfg.get("cdp_port", DEFAULT_CDP_PORT) or DEFAULT_CDP_PORT)
         except (TypeError, ValueError):
             port = DEFAULT_CDP_PORT
-        result = _send_via_cdp(text, url_match, port)
+        result = _send_via_cdp(text, url_match, port, url_exclude)
     if result.get("ok"):
         logger.info("Muse 对话提醒已发送（%s）", result.get("method"))
     else:
@@ -751,13 +769,15 @@ def main(argv: list[str] | None = None) -> int:
         help="要发送的测试文本（默认一条无害的测试消息）",
     )
     parser.add_argument("--url-match", default=DEFAULT_URL_MATCH, help="标签页 URL 匹配串（默认 muse.ai）")
+    parser.add_argument("--url-exclude", default=DEFAULT_URL_EXCLUDE, help="排除含此串的标签页 URL（默认空串，不排除；填 /thread/ 只发主对话）")
     parser.add_argument("--method", default="auto", help="auto | applescript | cdp | safari（默认 auto）")
     parser.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT, help="CDP 端口（默认 9222）")
     args = parser.parse_args(argv)
-    cfg = {"url_match": args.url_match, "method": args.method, "cdp_port": args.cdp_port}
+    cfg = {"url_match": args.url_match, "url_exclude": args.url_exclude, "method": args.method, "cdp_port": args.cdp_port}
     method = _resolve_method(args.method)
     print(f"平台：{sys.platform}，方法：{method}")
     print(f"标签页 URL 匹配：{args.url_match}")
+    print(f"标签页 URL 排除：{args.url_exclude or '（无）'}")
     result = send_to_muse_chat(args.test, cfg)
     if result.get("ok"):
         detail = result.get("detail") or {}

@@ -704,5 +704,161 @@ class TestSubmitChainHardening(unittest.TestCase):
         self.assertIn("disabled", str(fake_logger.warning.call_args[0]))
 
 
+
+class TestUrlExclude(unittest.TestCase):
+    """url_exclude：主对话地址是裸域名 https://muse.ai，侧边对话是
+    /thread/<uuid>，url_match="muse.ai" 两个都中；用 url_exclude="/thread/"
+    把侧边对话排除，只发主对话（2026-11-19，08:00 简报因此发到找工作对话）。"""
+
+    _EXCLUDE_TARGETS = [
+        {"type": "page", "url": "https://muse.ai/thread/9a12e763-9077-4525-b38a-33d0950683f7", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/THREAD"},
+        {"type": "page", "url": "https://muse.ai", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/MAIN"},
+    ]
+
+    def _run_cdp(self, targets, url_exclude):
+        fake_ws = _FakeWS()
+        fake_module = mock.Mock()
+        fake_module.create_connection = mock.Mock(return_value=fake_ws)
+        urlopen = mock.Mock(return_value=_FakeResp(targets))
+        with (
+            mock.patch("urllib.request.urlopen", urlopen),
+            mock.patch.dict(sys.modules, {"websocket": fake_module}),
+        ):
+            result = muse_chat._send_via_cdp("hello 提醒", "muse.ai", 9222, url_exclude)
+        return result, fake_module
+
+    def _run_osascript(self, send_fn, url_exclude, stdout='{"ok": true, "input": "textarea", "submitted": "button"}'):
+        proc = mock.Mock()
+        proc.stdout = stdout
+        proc.stderr = ""
+        proc.returncode = 0
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["scpt"] = Path(cmd[1]).read_text(encoding="utf-8")
+            return proc
+
+        with mock.patch("trend_radar.muse_chat.subprocess.run", side_effect=fake_run):
+            result = send_fn("hello 提醒", "muse.ai", url_exclude)
+        return result, captured
+
+    def test_safari_template_has_exclude_check(self):
+        tpl = muse_chat.SAFARI_APPLESCRIPT_TEMPLATE
+        self.assertIn("urlExclude", tpl)
+        # AppleScript 里 "" contains "" 为真，必须显式判断空串才跳过排除。
+        self.assertIn('urlExclude is ""', tpl)
+        self.assertIn("does not contain urlExclude", tpl)
+
+    def test_chrome_template_has_exclude_check(self):
+        tpl = muse_chat.APPLESCRIPT_TEMPLATE
+        self.assertIn("urlExclude", tpl)
+        self.assertIn('urlExclude is ""', tpl)
+        self.assertIn("does not contain urlExclude", tpl)
+
+    def test_safari_passes_exclude_as_argv(self):
+        result, captured = self._run_osascript(muse_chat._send_via_safari, "/thread/")
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(captured["cmd"][4], "/thread/")
+
+    def test_applescript_passes_empty_exclude_by_default(self):
+        # url_exclude 不传时 osascript 第 4 个参数是 ""，模板里
+        # urlExclude is "" 的分支保证一个都不排除。
+        result, captured = self._run_osascript(muse_chat._send_via_applescript, "")
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(captured["cmd"][4], "")
+
+    def test_cdp_excludes_thread_url_keeps_bare_domain(self):
+        result, fake_module = self._run_cdp(self._EXCLUDE_TARGETS, "/thread/")
+        self.assertEqual(result["ok"], True)
+        fake_module.create_connection.assert_called_once_with(
+            "ws://127.0.0.1:9222/devtools/page/MAIN", timeout=10
+        )
+
+    def test_cdp_all_excluded_is_no_tab(self):
+        result, fake_module = self._run_cdp(self._EXCLUDE_TARGETS[:1], "/thread/")
+        self.assertEqual(result, {"ok": False, "reason": "no_muse_tab"})
+        fake_module.create_connection.assert_not_called()
+
+    def test_cdp_empty_exclude_keeps_old_behavior(self):
+        # url_exclude 为 "" 时不排除任何东西：排第一的 /thread/ 标签页照样选中。
+        result, fake_module = self._run_cdp(self._EXCLUDE_TARGETS, "")
+        self.assertEqual(result["ok"], True)
+        fake_module.create_connection.assert_called_once_with(
+            "ws://127.0.0.1:9222/devtools/page/THREAD", timeout=10
+        )
+
+    def test_send_to_muse_chat_passes_exclude_through(self):
+        with (
+            mock.patch.object(muse_chat, "_resolve_method", return_value="safari"),
+            mock.patch.object(
+                muse_chat,
+                "_send_via_safari",
+                mock.Mock(return_value={"ok": True, "method": "safari"}),
+            ) as send,
+        ):
+            result = muse_chat.send_to_muse_chat(
+                "hi", {"method": "safari", "url_match": "muse.ai", "url_exclude": "/thread/"}
+            )
+        self.assertEqual(result, {"ok": True, "method": "safari"})
+        send.assert_called_once_with("hi", "muse.ai", "/thread/")
+
+    def test_send_to_muse_chat_defaults_exclude_to_empty(self):
+        with (
+            mock.patch.object(muse_chat, "_resolve_method", return_value="safari"),
+            mock.patch.object(
+                muse_chat,
+                "_send_via_safari",
+                mock.Mock(return_value={"ok": True, "method": "safari"}),
+            ) as send,
+        ):
+            muse_chat.send_to_muse_chat("hi", {"method": "safari"})
+        send.assert_called_once_with("hi", "muse.ai", "")
+
+    def test_cli_passes_url_exclude(self):
+        with (
+            mock.patch.object(
+                muse_chat,
+                "send_to_muse_chat",
+                mock.Mock(
+                    return_value={
+                        "ok": True,
+                        "method": "safari",
+                        "detail": {"input": "textarea", "submitted": "button"},
+                    }
+                ),
+            ) as send,
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertEqual(muse_chat.main(["--test", "hi", "--url-exclude", "/thread/"]), 0)
+        send.assert_called_once_with(
+            "hi",
+            {"url_match": "muse.ai", "method": "auto", "cdp_port": 9222, "url_exclude": "/thread/"},
+        )
+        self.assertIn("标签页 URL 排除：/thread/", out.getvalue())
+
+    def test_cli_default_exclude_is_empty(self):
+        with (
+            mock.patch.object(
+                muse_chat,
+                "send_to_muse_chat",
+                mock.Mock(
+                    return_value={
+                        "ok": True,
+                        "method": "safari",
+                        "detail": {"input": "textarea", "submitted": "button"},
+                    }
+                ),
+            ) as send,
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertEqual(muse_chat.main(["--test", "hi"]), 0)
+        send.assert_called_once_with(
+            "hi",
+            {"url_match": "muse.ai", "method": "auto", "cdp_port": 9222, "url_exclude": ""},
+        )
+        self.assertIn("标签页 URL 排除：（无）", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

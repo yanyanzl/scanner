@@ -130,6 +130,7 @@ telegram:
 muse_chat:
   enabled: true
   url_match: "muse.ai"
+  url_exclude: ""  # 排除含此串的标签页：填 "/thread/" 可让提醒只发主对话（主对话地址是裸域名 muse.ai，侧边对话都在 /thread/<id> 下）；空串表示不排除。通用值，不含个人对话 ID，可进仓库。本地如需启用，把 "" 改成 "/thread/"（本地改动，不提交）。
   method: auto  # auto | applescript | cdp | safari；auto = macOS 用 AppleScript，Windows 用 CDP；macOS 也可填 safari 走 Safari（2026-11-15 起 Chrome 的 AppleScript 在本机不可用，见 docs/MUSE_CHAT.md）
   cdp_port: 9222
 

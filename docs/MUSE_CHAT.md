@@ -79,6 +79,33 @@ Telegram 提醒之外，爆发事件再打一份进用户自己浏览器（Chrom
 - 任何失败（标签页没开、Chrome 没开、权限没给、端口没开）只记 warning，
   不影响本轮采集、不影响 Telegram 提醒。
 
+## 把提醒固定到主对话（url_exclude，2026-11-19）
+
+主对话在浏览器里的地址是裸域名 `https://muse.ai`，侧边对话都是
+`https://muse.ai/thread/<uuid>`。`url_match` 是子串匹配，只填 `muse.ai`
+两个都中；只把 `url_match` 改成主对话地址也分不出来——主对话地址是侧边
+对话地址的前缀。所以加了 `url_exclude`：发送时找含 `url_match` 且不含
+`url_exclude` 的标签页（Safari、Chrome、Windows CDP 三条路径一致；
+`url_exclude` 为空串时不排除任何东西，行为和以前完全一样）。
+
+本地 `config.yaml` 里这样设（本地改动，不提交——线程 ID 是个人的；
+仓库默认值保持 `url_match: "muse.ai"`、`url_exclude: ""`）：
+
+```yaml
+muse_chat:
+  url_match: "muse.ai"
+  url_exclude: "/thread/"
+```
+
+2026-11-19 08:00 的简报就是没做这个区分的教训：当时 Safari 前台标签页
+停在找工作对话上，简报准时发了、却发到了那边，主对话这边没收到，只能
+手动复制粘贴；补发重试也救不了——扫描器看来发送是成功的，不会重试。
+
+主对话标签页根本没打开时：三个路径都找不到匹配标签页，返回
+`no_muse_tab`，发送失败。简报会记进待补发（`data/.digest_pending.json`），
+下一轮自动重发（见 `docs/QUALITY_DIGEST.md`）；爆发提醒是一次性的，
+靠 Telegram 备份。
+
 ## 设置步骤（只做一次）
 
 ### macOS：AppleScript，不用装东西、不用重启 Chrome
